@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Signal Bot - TheTrueTrade
+Signal Bot Pro - TheTrueTrade
 ====================================================================
-ربات دریافت داده و ارسال سیگنال به تلگرام با محاسبه نقاط ورود، حد ضرر و حد سود
-(بدون معامله خودکار) - منطق استراتژی دقیقاً از پروژه قبلی کپی شده است
+ربات سیگنال‌دهی پیشرفته با هشدارهای هوشمند، پیگیری معاملات و گزارش‌های دوره‌ای
 """
 
 import time
@@ -13,6 +12,8 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 import threading
 from flask import Flask
+import json
+import os
 
 # =====================================================================================
 # تنظیمات تلگرام
@@ -24,6 +25,11 @@ TELEGRAM_CHAT_ID = "7402770612"
 # تنظیمات صرافی
 # =====================================================================================
 BASE_URL = "https://apiv2.thetruetrade.io"
+
+# =====================================================================================
+# فایل ذخیره تاریخچه معاملات
+# =====================================================================================
+HISTORY_FILE = "trades_history.json"
 
 # =====================================================================================
 # کلاس دریافت داده بدون نیاز به احراز هویت
@@ -78,7 +84,7 @@ class TrueTradeData:
             return None
 
 # =====================================================================================
-# توابع ارسال پیام به تلگرام
+# توابع ارسال پیام به تلگرام (با قالب‌های جذاب)
 # =====================================================================================
 def send_telegram_message(message: str):
     """ارسال پیام به تلگرام"""
@@ -105,7 +111,7 @@ def format_iran_time(dt=None):
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 # =====================================================================================
-# توابع محاسباتی استراتژی (دقیقاً از پروژه قبلی کپی شده)
+# توابع محاسباتی استراتژی (دقیقاً از پروژه قبلی)
 # =====================================================================================
 def calc_rsi(close: pd.Series, length: int = 14) -> pd.Series:
     delta = close.diff()
@@ -192,7 +198,7 @@ def is_trending_down(close: pd.Series, ref_bar: int, lookback: int = 20, slope_m
     return (slope / avg) * 100 < -slope_min_pct
 
 def compute_stop_and_targets(state, direction, df, atr_val):
-    """محاسبه حد ضرر و حد سود - دقیقاً از پروژه قبلی"""
+    """محاسبه حد ضرر و حد سود"""
     if direction == "long":
         if state['pl_price_1'] is None or state['pl_price_2'] is None:
             return None
@@ -222,7 +228,7 @@ def compute_stop_and_targets(state, direction, df, atr_val):
     return None
 
 def resolve_final_target(entry_price: float, stop_price: float, tp1_raw: float, direction: str, min_rr_ratio: float = 2.0) -> float:
-    """محاسبه حد سود نهایی با نسبت ریسک به ریوارد - دقیقاً از پروژه قبلی"""
+    """محاسبه حد سود نهایی با نسبت ریسک به ریوارد"""
     risk_dist = abs(entry_price - stop_price)
     if risk_dist <= 0:
         return tp1_raw
@@ -251,16 +257,49 @@ class SymbolState:
         self.pl_rsi_2 = self.pl_rsi_1 = None
         self.pl_macdline_2 = self.pl_macdline_1 = None
         self.pl_hist_2 = self.pl_hist_1 = None
+        
+        # برای تشخیص سیگنال نزدیک
+        self.last_check_price = None
+        self.alert_sent = False
 
 # =====================================================================================
-# تابع تشخیص سیگنال کامل (دقیقاً از پروژه قبلی)
+# مدیریت تاریخچه معاملات
 # =====================================================================================
-def detect_signal(df, state):
-    """تشخیص سیگنال با استفاده از منطق کامل DTM - دقیقاً از پروژه قبلی"""
+def load_history():
+    """بارگذاری تاریخچه معاملات از فایل"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def save_history(history):
+    """ذخیره تاریخچه معاملات در فایل"""
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
+
+def update_trade_result(symbol, signal_time, result, price):
+    """به‌روزرسانی نتیجه یک معامله (تارگت یا استاپ)"""
+    history = load_history()
+    for trade in history:
+        if trade['symbol'] == symbol and trade['signal_time'] == signal_time:
+            trade['result'] = result
+            trade['close_price'] = price
+            trade['close_time'] = format_iran_time()
+            break
+    save_history(history)
+
+# =====================================================================================
+# تابع تشخیص سیگنال کامل (با قابلیت هشدار زودهنگام)
+# =====================================================================================
+def detect_signal(df, state, symbol):
+    """تشخیص سیگنال با هشدار زودهنگام در RIGHT_BARS=2"""
     closed_df = df.iloc[:-1].reset_index(drop=True)
     n = len(closed_df)
     if n < 5 + 3 + 20 + 5:
-        return None, None, None, None
+        return None, None, None, None, False
 
     close = closed_df["close"]
     high = closed_df["high"]
@@ -274,8 +313,19 @@ def detect_signal(df, state):
 
     last_i = n - 1
     pivot_check_i = last_i - 3
+    
+    # هشدار زودهنگام (در RIGHT_BARS=2)
+    early_check_i = last_i - 2
+    early_signal = False
+    
+    if early_check_i >= 5:
+        early_high = not pd.isna(pivot_high.iloc[early_check_i])
+        early_low = not pd.isna(pivot_low.iloc[early_check_i])
+        if early_high or early_low:
+            early_signal = True
+
     if pivot_check_i < 5:
-        return None, None, None, None
+        return None, None, None, None, early_signal
 
     new_pivot_high = not pd.isna(pivot_high.iloc[pivot_check_i])
     new_pivot_low = not pd.isna(pivot_low.iloc[pivot_check_i])
@@ -331,6 +381,7 @@ def detect_signal(df, state):
     hidden_bearish = price_lower_high and rsi_higher_high and macdline_higher_high and hist_higher_high and both_peaks_green and macd_color_changed_highs
 
     entry_price = close.iloc[last_i]
+    current_price = df['close'].iloc[-1]
 
     if classic_bullish or hidden_bullish:
         levels = compute_stop_and_targets({
@@ -345,7 +396,7 @@ def detect_signal(df, state):
         }, "long", closed_df, atr14.iloc[last_i])
         if levels:
             target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "long")
-            return "BUY", entry_price, levels["stop"], target
+            return "BUY", entry_price, levels["stop"], target, early_signal
 
     if classic_bearish or hidden_bearish:
         levels = compute_stop_and_targets({
@@ -360,20 +411,219 @@ def detect_signal(df, state):
         }, "short", closed_df, atr14.iloc[last_i])
         if levels:
             target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "short")
-            return "SELL", entry_price, levels["stop"], target
+            return "SELL", entry_price, levels["stop"], target, early_signal
 
-    return None, None, None, None
+    return None, None, None, None, early_signal
+
+# =====================================================================================
+# بررسی نزدیکی به تارگت یا استاپ
+# =====================================================================================
+def check_proximity(symbol, current_price, entry, stop, target):
+    """بررسی نزدیکی قیمت به تارگت یا استاپ و ارسال هشدار"""
+    if entry is None or stop is None or target is None:
+        return
+    
+    # محاسبه فاصله درصدی
+    stop_distance = abs(current_price - stop) / entry * 100
+    target_distance = abs(current_price - target) / entry * 100
+    
+    # اگر قیمت به تارگت نزدیک شد (کمتر از 5%)
+    if target_distance < 5 and target_distance > 0:
+        message = (
+            f"🎯 **هشدار نزدیکی به تارگت**\n"
+            f"🔹 **نماد:** {symbol}\n"
+            f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+            f"🎯 **تارگت:** {target:.4f}\n"
+            f"📊 **فاصله:** {target_distance:.2f}%\n"
+            f"🕒 **زمان ایران:** {format_iran_time()}\n"
+            f"💡 **وضعیت:** در آستانه رسیدن به تارگت!"
+        )
+        send_telegram_message(message)
+        print(f"[PROXIMITY] {symbol}: نزدیک به تارگت! فاصله: {target_distance:.2f}%")
+    
+    # اگر قیمت به استاپ نزدیک شد (کمتر از 5%)
+    elif stop_distance < 5 and stop_distance > 0:
+        message = (
+            f"🛑 **هشدار نزدیکی به استاپ**\n"
+            f"🔹 **نماد:** {symbol}\n"
+            f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+            f"🛑 **استاپ:** {stop:.4f}\n"
+            f"📊 **فاصله:** {stop_distance:.2f}%\n"
+            f"🕒 **زمان ایران:** {format_iran_time()}\n"
+            f"💡 **وضعیت:** در آستانه رسیدن به استاپ!"
+        )
+        send_telegram_message(message)
+        print(f"[PROXIMITY] {symbol}: نزدیک به استاپ! فاصله: {stop_distance:.2f}%")
+
+# =====================================================================================
+# پیگیری سیگنال‌های باز
+# =====================================================================================
+def track_open_signals():
+    """پیگیری سیگنال‌های باز و تشخیص تارگت یا استاپ"""
+    history = load_history()
+    data = TrueTradeData()
+    
+    for trade in history:
+        if trade.get('result') is None:  # معامله هنوز باز است
+            symbol = trade['symbol']
+            df = data.fetch_ohlcv(symbol, '1m', 10)
+            if df is None or df.empty:
+                continue
+            
+            current_price = df['close'].iloc[-1]
+            entry = trade['entry_price']
+            stop = trade['stop_loss']
+            target = trade['take_profit']
+            
+            # بررسی نزدیکی به تارگت یا استاپ
+            check_proximity(symbol, current_price, entry, stop, target)
+            
+            # بررسی رسیدن به تارگت
+            if trade['direction'] == 'BUY' and current_price >= target:
+                update_trade_result(symbol, trade['signal_time'], 'TAKE_PROFIT', current_price)
+                message = (
+                    f"🎉 **تارگت محقق شد!**\n"
+                    f"🔹 **نماد:** {symbol}\n"
+                    f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+                    f"🎯 **تارگت:** {target:.4f}\n"
+                    f"📈 **سود:** {(current_price - entry) / entry * 100:.2f}%\n"
+                    f"🕒 **زمان ایران:** {format_iran_time()}"
+                )
+                send_telegram_message(message)
+                print(f"[RESULT] {symbol}: تارگت خورد! قیمت: {current_price:.4f}")
+                
+            elif trade['direction'] == 'SELL' and current_price <= target:
+                update_trade_result(symbol, trade['signal_time'], 'TAKE_PROFIT', current_price)
+                message = (
+                    f"🎉 **تارگت محقق شد!**\n"
+                    f"🔹 **نماد:** {symbol}\n"
+                    f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+                    f"🎯 **تارگت:** {target:.4f}\n"
+                    f"📈 **سود:** {(entry - current_price) / entry * 100:.2f}%\n"
+                    f"🕒 **زمان ایران:** {format_iran_time()}"
+                )
+                send_telegram_message(message)
+                print(f"[RESULT] {symbol}: تارگت خورد! قیمت: {current_price:.4f}")
+                
+            # بررسی رسیدن به استاپ
+            elif trade['direction'] == 'BUY' and current_price <= stop:
+                update_trade_result(symbol, trade['signal_time'], 'STOP_LOSS', current_price)
+                message = (
+                    f"💔 **استاپ خورد!**\n"
+                    f"🔹 **نماد:** {symbol}\n"
+                    f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+                    f"🛑 **استاپ:** {stop:.4f}\n"
+                    f"📉 **ضرر:** {(current_price - entry) / entry * 100:.2f}%\n"
+                    f"🕒 **زمان ایران:** {format_iran_time()}"
+                )
+                send_telegram_message(message)
+                print(f"[RESULT] {symbol}: استاپ خورد! قیمت: {current_price:.4f}")
+                
+            elif trade['direction'] == 'SELL' and current_price >= stop:
+                update_trade_result(symbol, trade['signal_time'], 'STOP_LOSS', current_price)
+                message = (
+                    f"💔 **استاپ خورد!**\n"
+                    f"🔹 **نماد:** {symbol}\n"
+                    f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+                    f"🛑 **استاپ:** {stop:.4f}\n"
+                    f"📉 **ضرر:** {(entry - current_price) / entry * 100:.2f}%\n"
+                    f"🕒 **زمان ایران:** {format_iran_time()}"
+                )
+                send_telegram_message(message)
+                print(f"[RESULT] {symbol}: استاپ خورد! قیمت: {current_price:.4f}")
+
+# =====================================================================================
+# گزارش روزانه و ماهانه
+# =====================================================================================
+def send_daily_report():
+    """ارسال گزارش روزانه"""
+    history = load_history()
+    if not history:
+        send_telegram_message("📋 **گزارش روزانه**\nامروز هیچ معامله‌ای انجام نشده است.")
+        return
+    
+    today = datetime.now().date()
+    today_trades = [t for t in history if datetime.fromisoformat(t['signal_time']).date() == today]
+    
+    if not today_trades:
+        send_telegram_message("📋 **گزارش روزانه**\nامروز هیچ معامله‌ای انجام نشده است.")
+        return
+    
+    total = len(today_trades)
+    wins = len([t for t in today_trades if t.get('result') == 'TAKE_PROFIT'])
+    losses = len([t for t in today_trades if t.get('result') == 'STOP_LOSS'])
+    open_trades = len([t for t in today_trades if t.get('result') is None])
+    
+    message = (
+        f"📅 **گزارش روزانه ({format_iran_time().split()[0]})**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 **معاملات امروز:** {total} عدد\n"
+        f"✅ **موفق (تارگت):** {wins} عدد\n"
+        f"❌ **ناموفق (استاپ):** {losses} عدد\n"
+        f"⏳ **باز:** {open_trades} عدد\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 **نرخ موفقیت:** {wins/total*100 if total > 0 else 0:.1f}%\n"
+    )
+    
+    # اضافه کردن جزئیات معاملات
+    for i, trade in enumerate(today_trades[-5:], 1):  # آخرین ۵ معامله
+        result_emoji = "✅" if trade.get('result') == 'TAKE_PROFIT' else "❌" if trade.get('result') == 'STOP_LOSS' else "⏳"
+        message += (
+            f"\n{i}. {trade['symbol']} {trade['direction']} {result_emoji}"
+            f" | Entry: {trade['entry_price']:.4f}"
+            f" | SL: {trade['stop_loss']:.4f}"
+            f" | TP: {trade['take_profit']:.4f}"
+        )
+    
+    send_telegram_message(message)
+
+def send_monthly_report():
+    """ارسال گزارش ماهانه"""
+    history = load_history()
+    if not history:
+        send_telegram_message("📊 **گزارش ماهانه**\nاین ماه هیچ معامله‌ای انجام نشده است.")
+        return
+    
+    today = datetime.now()
+    month_ago = today - timedelta(days=30)
+    month_trades = [t for t in history if datetime.fromisoformat(t['signal_time']) >= month_ago]
+    
+    if not month_trades:
+        send_telegram_message("📊 **گزارش ماهانه**\nاین ماه هیچ معامله‌ای انجام نشده است.")
+        return
+    
+    total = len(month_trades)
+    wins = len([t for t in month_trades if t.get('result') == 'TAKE_PROFIT'])
+    losses = len([t for t in month_trades if t.get('result') == 'STOP_LOSS'])
+    open_trades = len([t for t in month_trades if t.get('result') is None])
+    
+    message = (
+        f"📊 **گزارش ماهانه (۳۰ روز گذشته)**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 **کل معاملات:** {total} عدد\n"
+        f"✅ **موفق (تارگت):** {wins} عدد\n"
+        f"❌ **ناموفق (استاپ):** {losses} عدد\n"
+        f"⏳ **باز:** {open_trades} عدد\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 **نرخ موفقیت:** {wins/total*100 if total > 0 else 0:.1f}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 **میانگین سود/ضرر روزانه:** {(wins - losses) / 30:.2f} معامله\n"
+    )
+    
+    send_telegram_message(message)
 
 # =====================================================================================
 # تابع اصلی تحلیل و ارسال سیگنال
 # =====================================================================================
 def analyze_and_send():
-    """دریافت داده، تحلیل و ارسال سیگنال به تلگرام با نقاط ورود، استاپ و تارگت"""
+    """دریافت داده، تحلیل و ارسال سیگنال به تلگرام با هشدار زودهنگام"""
     data = TrueTradeData()
     symbols = ["LTCUSDT", "DOGEUSDT", "ETHUSDT"]
     
-    # وضعیت هر نماد (برای نگهداری قله‌ها و کف‌ها)
     states = {symbol: SymbolState() for symbol in symbols}
+    
+    # پیگیری سیگنال‌های باز
+    track_open_signals()
     
     for symbol in symbols:
         try:
@@ -384,28 +634,79 @@ def analyze_and_send():
             
             print(f"[DATA] {symbol}: {len(df)} کندل دریافت شد")
             
-            signal, entry_price, stop_loss, take_profit = detect_signal(df, states[symbol])
+            signal, entry_price, stop_loss, take_profit, early_signal = detect_signal(df, states[symbol], symbol)
+            
+            current_price = df['close'].iloc[-1]
+            
+            # هشدار زودهنگام
+            if early_signal and not states[symbol].alert_sent:
+                message = (
+                    f"⚠️ **هشدار آماده باش!**\n"
+                    f"🔹 **نماد:** {symbol}\n"
+                    f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+                    f"🕒 **زمان ایران:** {format_iran_time()}\n"
+                    f"💡 **وضعیت:** احتمال تشکیل قله/کف جدید!\n"
+                    f"⏳ **زمان تا سیگنال نهایی:** ~۲ دقیقه"
+                )
+                send_telegram_message(message)
+                states[symbol].alert_sent = True
+                print(f"[EARLY] {symbol}: هشدار آماده باش ارسال شد")
             
             if signal is not None:
+                # ارسال سیگنال اصلی
                 iran_time = format_iran_time()
-                
-                # تعیین جهت سیگنال
                 direction_text = "🟢 خرید (BUY)" if signal == "BUY" else "🔴 فروش (SELL)"
                 direction_emoji = "🟢" if signal == "BUY" else "🔴"
                 
-                message = f"📊 **سیگنال معاملاتی - ربات سیگنال‌دهی**\n"
-                message += f"🔹 **نماد:** {symbol}\n"
-                message += f"🔸 **نوع:** {direction_text}\n"
-                message += f"💰 **قیمت فعلی:** {df['close'].iloc[-1]:.4f}\n"
-                message += f"📍 **نقطه ورود:** {entry_price:.4f}\n"
-                message += f"🛑 **حد ضرر (Stop Loss):** {stop_loss:.4f}\n"
-                message += f"🎯 **حد سود (Take Profit):** {take_profit:.4f}\n"
-                message += f"🕒 **زمان ایران:** {iran_time}\n"
-                message += f"📊 **استراتژی:** DTM Divergence\n"
-                message += f"🤖 **ربات:** SignalBot (فقط سیگنال، بدون معامله)"
+                # تخمین سود و ضرر
+                if signal == "BUY":
+                    potential_profit = (take_profit - entry_price) / entry_price * 100
+                    potential_loss = (entry_price - stop_loss) / entry_price * 100
+                else:
+                    potential_profit = (entry_price - take_profit) / entry_price * 100
+                    potential_loss = (stop_loss - entry_price) / entry_price * 100
+                
+                message = (
+                    f"📊 **سیگنال معاملاتی - ربات سیگنال‌دهی حرفه‌ای**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔹 **نماد:** {symbol}\n"
+                    f"🔸 **نوع:** {direction_text}\n"
+                    f"💰 **قیمت فعلی:** {current_price:.4f}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 **نقطه ورود:** {entry_price:.4f}\n"
+                    f"🛑 **حد ضرر (Stop Loss):** {stop_loss:.4f}\n"
+                    f"🎯 **حد سود (Take Profit):** {take_profit:.4f}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📈 **سود احتمالی:** {potential_profit:.2f}%\n"
+                    f"📉 **ضرر احتمالی:** {potential_loss:.2f}%\n"
+                    f"📊 **نسبت ریسک به ریوارد:** 1:{take_profit - entry_price / (entry_price - stop_loss):.2f}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕒 **زمان ایران:** {iran_time}\n"
+                    f"🤖 **ربات:** SignalBot Pro (فقط سیگنال، بدون معامله)\n"
+                    f"💡 **توجه:** این سیگنال با استراتژی DTM Divergence تولید شده است."
+                )
                 
                 send_telegram_message(message)
                 print(f"[SIGNAL] {symbol}: {signal} | Entry: {entry_price:.4f} | SL: {stop_loss:.4f} | TP: {take_profit:.4f}")
+                
+                # ذخیره سیگنال در تاریخچه
+                history = load_history()
+                history.append({
+                    'symbol': symbol,
+                    'direction': signal,
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'signal_time': format_iran_time(),
+                    'result': None,
+                    'close_price': None,
+                    'close_time': None
+                })
+                save_history(history)
+                
+                # ریست هشدار
+                states[symbol].alert_sent = False
+                
             else:
                 print(f"[ANALYSIS] {symbol}: بدون سیگنال")
                 
@@ -417,11 +718,27 @@ def analyze_and_send():
 # =====================================================================================
 def signal_loop():
     """حلقه بررسی مداوم"""
+    # متغیرهای کنترل گزارش
+    last_daily_report = None
+    last_monthly_report = None
+    
     while True:
         try:
             print("[LOOP] شروع یک دور جدید بررسی...")
             analyze_and_send()
             print("[LOOP] پایان دور بررسی، ۶۰ ثانیه مکث...")
+            
+            # بررسی گزارش روزانه
+            today = datetime.now().date()
+            if last_daily_report != today:
+                send_daily_report()
+                last_daily_report = today
+            
+            # بررسی گزارش ماهانه
+            if last_monthly_report is None or (datetime.now() - last_monthly_report).days >= 30:
+                send_monthly_report()
+                last_monthly_report = datetime.now()
+            
             time.sleep(60)
             
         except Exception as e:
@@ -435,7 +752,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def health_check():
-    return "Signal Bot is running.", 200
+    return "Signal Bot Pro is running.", 200
 
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
@@ -445,7 +762,16 @@ def run_flask():
 # =====================================================================================
 if __name__ == "__main__":
     # ارسال پیام استارت
-    send_telegram_message("🤖 **ربات سیگنال‌دهی DTM (SignalBot) راه‌اندازی شد!**\n📊 در حال دریافت داده و تحلیل بازار...\n⚠️ **توجه:** این ربات فقط سیگنال ارسال می‌کند و هیچ معامله‌ای انجام نمی‌دهد.")
+    send_telegram_message(
+        "🤖 **ربات سیگنال‌دهی حرفه‌ای (SignalBot Pro) راه‌اندازی شد!**\n"
+        "📊 در حال دریافت داده و تحلیل بازار...\n"
+        "⚠️ **توجه:** این ربات فقط سیگنال ارسال می‌کند و هیچ معامله‌ای انجام نمی‌دهد.\n"
+        "💡 **قابلیت‌ها:**\n"
+        "• هشدار آماده باش ۲ دقیقه قبل از سیگنال\n"
+        "• پیگیری تارگت/استاپ\n"
+        "• گزارش‌های روزانه و ماهانه\n"
+        "• هشدار نزدیک شدن به تارگت/استاپ"
+    )
     
     # اجرای Flask در یک ترد جداگانه
     flask_thread = threading.Thread(target=run_flask, daemon=True)
