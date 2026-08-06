@@ -2,7 +2,8 @@
 """
 Signal Bot - TheTrueTrade
 ====================================================================
-ربات دریافت داده و ارسال سیگنال به تلگرام (بدون معامله خودکار)
+ربات دریافت داده و ارسال سیگنال به تلگرام با محاسبه نقاط ورود، حد ضرر و حد سود
+(بدون معامله خودکار) - منطق استراتژی دقیقاً از پروژه قبلی کپی شده است
 """
 
 import time
@@ -61,7 +62,6 @@ class TrueTradeData:
             if not data or data.get('s') != 'ok':
                 return None
             
-            # تبدیل به دیتافریم
             df = pd.DataFrame({
                 'timestamp': pd.to_datetime(data['t'], unit='s'),
                 'open': pd.to_numeric(data['o']),
@@ -105,25 +105,37 @@ def format_iran_time(dt=None):
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 # =====================================================================================
-# توابع محاسباتی (ساده‌شده برای شناسایی سیگنال)
+# توابع محاسباتی استراتژی (دقیقاً از پروژه قبلی کپی شده)
 # =====================================================================================
 def calc_rsi(close: pd.Series, length: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=length, min_periods=length).mean()
-    avg_loss = loss.rolling(window=length, min_periods=length).mean()
+    avg_gain = gain.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
+def calc_ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
 def calc_macd(close: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    ema_fast = calc_ema(close, fast)
+    ema_slow = calc_ema(close, slow)
     macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    signal_line = calc_ema(macd_line, signal)
     hist_line = macd_line - signal_line
     return macd_line, signal_line, hist_line
+
+def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
 
 def find_pivot_high(high: pd.Series, left_bars: int = 5, right_bars: int = 3):
     n = len(high)
@@ -147,52 +159,221 @@ def find_pivot_low(low: pd.Series, left_bars: int = 5, right_bars: int = 3):
             result.iloc[i] = center
     return result
 
-def detect_divergence(df, lookback=20):
-    """
-    تشخیص واگرایی ساده DTM
-    برگرداندن سیگنال: 'BUY', 'SELL', یا 'NONE'
-    """
-    close = df['close']
-    high = df['high']
-    low = df['low']
-    
-    rsi = calc_rsi(close)
-    macd_line, signal_line, hist_line = calc_macd(close)
-    
-    pivot_high = find_pivot_high(high)
-    pivot_low = find_pivot_low(low)
-    
-    last_i = len(df) - 1
+def check_color_change(hist_line: pd.Series, bar_start: int, bar_end: int, need_red_phase: bool) -> bool:
+    if bar_start is None or bar_end is None or bar_end <= bar_start:
+        return False
+    segment = hist_line.iloc[bar_start + 1:bar_end]
+    return (segment < 0).any() if need_red_phase else (segment > 0).any()
+
+def is_trending_up(close: pd.Series, ref_bar: int, lookback: int = 20, slope_min_pct: float = 0.05) -> bool:
+    if ref_bar is None or ref_bar - lookback < 0:
+        return False
+    y = close.iloc[ref_bar - lookback:ref_bar + 1].values
+    if len(y) < 2:
+        return False
+    x = np.arange(len(y))
+    slope = np.polyfit(x, y, 1)[0]
+    avg = y.mean()
+    if avg == 0:
+        return False
+    return (slope / avg) * 100 > slope_min_pct
+
+def is_trending_down(close: pd.Series, ref_bar: int, lookback: int = 20, slope_min_pct: float = 0.05) -> bool:
+    if ref_bar is None or ref_bar - lookback < 0:
+        return False
+    y = close.iloc[ref_bar - lookback:ref_bar + 1].values
+    if len(y) < 2:
+        return False
+    x = np.arange(len(y))
+    slope = np.polyfit(x, y, 1)[0]
+    avg = y.mean()
+    if avg == 0:
+        return False
+    return (slope / avg) * 100 < -slope_min_pct
+
+def compute_stop_and_targets(state, direction, df, atr_val):
+    """محاسبه حد ضرر و حد سود - دقیقاً از پروژه قبلی"""
+    if direction == "long":
+        if state['pl_price_1'] is None or state['pl_price_2'] is None:
+            return None
+        stop_price = min(state['pl_price_1'], state['pl_price_2']) - 0.05 * atr_val
+
+        bar1, bar2 = state['pl_bar_1'], state['pl_bar_2']
+        if bar1 is None or bar2 is None or bar2 <= bar1:
+            return None
+        mid_peak = df["high"].iloc[bar1 + 1:bar2].max() if bar2 > bar1 + 1 else df["high"].iloc[bar1:bar2 + 1].max()
+        if pd.isna(mid_peak):
+            return None
+        return {"stop": stop_price, "tp1_raw": mid_peak}
+
+    elif direction == "short":
+        if state['ph_price_1'] is None or state['ph_price_2'] is None:
+            return None
+        stop_price = max(state['ph_price_1'], state['ph_price_2']) + 0.05 * atr_val
+
+        bar1, bar2 = state['ph_bar_1'], state['ph_bar_2']
+        if bar1 is None or bar2 is None or bar2 <= bar1:
+            return None
+        mid_trough = df["low"].iloc[bar1 + 1:bar2].min() if bar2 > bar1 + 1 else df["low"].iloc[bar1:bar2 + 1].min()
+        if pd.isna(mid_trough):
+            return None
+        return {"stop": stop_price, "tp1_raw": mid_trough}
+
+    return None
+
+def resolve_final_target(entry_price: float, stop_price: float, tp1_raw: float, direction: str, min_rr_ratio: float = 2.0) -> float:
+    """محاسبه حد سود نهایی با نسبت ریسک به ریوارد - دقیقاً از پروژه قبلی"""
+    risk_dist = abs(entry_price - stop_price)
+    if risk_dist <= 0:
+        return tp1_raw
+    reward_dist = abs(tp1_raw - entry_price)
+    rr = reward_dist / risk_dist
+    if rr >= min_rr_ratio:
+        return tp1_raw
+    if direction == "long":
+        return entry_price + risk_dist * min_rr_ratio
+    else:
+        return entry_price - risk_dist * min_rr_ratio
+
+# =====================================================================================
+# کلاس وضعیت (برای نگهداری قله‌ها و کف‌ها)
+# =====================================================================================
+class SymbolState:
+    def __init__(self):
+        self.ph_price_2 = self.ph_price_1 = None
+        self.ph_bar_2 = self.ph_bar_1 = None
+        self.ph_rsi_2 = self.ph_rsi_1 = None
+        self.ph_macdline_2 = self.ph_macdline_1 = None
+        self.ph_hist_2 = self.ph_hist_1 = None
+
+        self.pl_price_2 = self.pl_price_1 = None
+        self.pl_bar_2 = self.pl_bar_1 = None
+        self.pl_rsi_2 = self.pl_rsi_1 = None
+        self.pl_macdline_2 = self.pl_macdline_1 = None
+        self.pl_hist_2 = self.pl_hist_1 = None
+
+# =====================================================================================
+# تابع تشخیص سیگنال کامل (دقیقاً از پروژه قبلی)
+# =====================================================================================
+def detect_signal(df, state):
+    """تشخیص سیگنال با استفاده از منطق کامل DTM - دقیقاً از پروژه قبلی"""
+    closed_df = df.iloc[:-1].reset_index(drop=True)
+    n = len(closed_df)
+    if n < 5 + 3 + 20 + 5:
+        return None, None, None, None
+
+    close = closed_df["close"]
+    high = closed_df["high"]
+    low = closed_df["low"]
+
+    rsi_val = calc_rsi(close, 14)
+    macd_line, signal_line, hist_line = calc_macd(close, 12, 26, 9)
+    atr14 = calc_atr(high, low, close, 14)
+    pivot_high = find_pivot_high(high, 5, 3)
+    pivot_low = find_pivot_low(low, 5, 3)
+
+    last_i = n - 1
     pivot_check_i = last_i - 3
-    
     if pivot_check_i < 5:
-        return 'NONE'
-    
+        return None, None, None, None
+
     new_pivot_high = not pd.isna(pivot_high.iloc[pivot_check_i])
     new_pivot_low = not pd.isna(pivot_low.iloc[pivot_check_i])
-    
-    # تشخیص واگرایی ساده
-    if new_pivot_low:
-        # بررسی کف‌های پایین‌تر قیمت و RSI بالاتر
-        if pivot_low.iloc[pivot_check_i] < pivot_low.iloc[pivot_check_i - 5]:
-            if rsi.iloc[pivot_check_i] > rsi.iloc[pivot_check_i - 5]:
-                return 'BUY'
-    
+
     if new_pivot_high:
-        # بررسی قله‌های بالاتر قیمت و RSI پایین‌تر
-        if pivot_high.iloc[pivot_check_i] > pivot_high.iloc[pivot_check_i - 5]:
-            if rsi.iloc[pivot_check_i] < rsi.iloc[pivot_check_i - 5]:
-                return 'SELL'
-    
-    return 'NONE'
+        state.ph_price_1, state.ph_bar_1 = state.ph_price_2, state.ph_bar_2
+        state.ph_rsi_1, state.ph_macdline_1, state.ph_hist_1 = state.ph_rsi_2, state.ph_macdline_2, state.ph_hist_2
+        state.ph_price_2 = pivot_high.iloc[pivot_check_i]
+        state.ph_bar_2 = pivot_check_i
+        state.ph_rsi_2 = rsi_val.iloc[pivot_check_i]
+        state.ph_macdline_2 = macd_line.iloc[pivot_check_i]
+        state.ph_hist_2 = hist_line.iloc[pivot_check_i]
+
+    if new_pivot_low:
+        state.pl_price_1, state.pl_bar_1 = state.pl_price_2, state.pl_bar_2
+        state.pl_rsi_1, state.pl_macdline_1, state.pl_hist_1 = state.pl_rsi_2, state.pl_macdline_2, state.pl_hist_2
+        state.pl_price_2 = pivot_low.iloc[pivot_check_i]
+        state.pl_bar_2 = pivot_check_i
+        state.pl_rsi_2 = rsi_val.iloc[pivot_check_i]
+        state.pl_macdline_2 = macd_line.iloc[pivot_check_i]
+        state.pl_hist_2 = hist_line.iloc[pivot_check_i]
+
+    macd_color_changed_highs = check_color_change(hist_line, state.ph_bar_1, state.ph_bar_2, True) if new_pivot_high and state.ph_bar_1 is not None else False
+    macd_color_changed_lows = check_color_change(hist_line, state.pl_bar_1, state.pl_bar_2, False) if new_pivot_low and state.pl_bar_1 is not None else False
+
+    trend_ok_bearish = is_trending_up(close, state.ph_bar_1, 20, 0.05) if new_pivot_high and state.ph_bar_1 is not None else False
+    trend_ok_bullish = is_trending_down(close, state.pl_bar_1, 20, 0.05) if new_pivot_low and state.pl_bar_1 is not None else False
+
+    price_higher_high = new_pivot_high and state.ph_price_1 is not None and state.ph_price_2 > state.ph_price_1
+    rsi_lower_high = new_pivot_high and state.ph_rsi_1 is not None and state.ph_rsi_2 < state.ph_rsi_1
+    macdline_lower_high = new_pivot_high and state.ph_macdline_1 is not None and state.ph_macdline_2 < state.ph_macdline_1
+    hist_lower_high = new_pivot_high and state.ph_hist_1 is not None and state.ph_hist_2 < state.ph_hist_1
+    both_peaks_green = new_pivot_high and state.ph_hist_1 is not None and state.ph_hist_1 > 0 and state.ph_hist_2 > 0
+    classic_bearish = price_higher_high and rsi_lower_high and macdline_lower_high and hist_lower_high and both_peaks_green and macd_color_changed_highs and trend_ok_bearish
+
+    price_lower_low = new_pivot_low and state.pl_price_1 is not None and state.pl_price_2 < state.pl_price_1
+    rsi_higher_low = new_pivot_low and state.pl_rsi_1 is not None and state.pl_rsi_2 > state.pl_rsi_1
+    macdline_higher_low = new_pivot_low and state.pl_macdline_1 is not None and state.pl_macdline_2 > state.pl_macdline_1
+    hist_higher_low = new_pivot_low and state.pl_hist_1 is not None and state.pl_hist_2 > state.pl_hist_1
+    both_troughs_red = new_pivot_low and state.pl_hist_1 is not None and state.pl_hist_1 < 0 and state.pl_hist_2 < 0
+    classic_bullish = price_lower_low and rsi_higher_low and macdline_higher_low and hist_higher_low and both_troughs_red and macd_color_changed_lows and trend_ok_bullish
+
+    price_higher_low = new_pivot_low and state.pl_price_1 is not None and state.pl_price_2 > state.pl_price_1
+    rsi_lower_low = new_pivot_low and state.pl_rsi_1 is not None and state.pl_rsi_2 < state.pl_rsi_1
+    macdline_lower_low = new_pivot_low and state.pl_macdline_1 is not None and state.pl_macdline_2 < state.pl_macdline_1
+    hist_lower_low = new_pivot_low and state.pl_hist_1 is not None and state.pl_hist_2 < state.pl_hist_1
+    hidden_bullish = price_higher_low and rsi_lower_low and macdline_lower_low and hist_lower_low and both_troughs_red and macd_color_changed_lows
+
+    price_lower_high = new_pivot_high and state.ph_price_1 is not None and state.ph_price_2 < state.ph_price_1
+    rsi_higher_high = new_pivot_high and state.ph_rsi_1 is not None and state.ph_rsi_2 > state.ph_rsi_1
+    macdline_higher_high = new_pivot_high and state.ph_macdline_1 is not None and state.ph_macdline_2 > state.ph_macdline_1
+    hist_higher_high = new_pivot_high and state.ph_hist_1 is not None and state.ph_hist_2 > state.ph_hist_1
+    hidden_bearish = price_lower_high and rsi_higher_high and macdline_higher_high and hist_higher_high and both_peaks_green and macd_color_changed_highs
+
+    entry_price = close.iloc[last_i]
+
+    if classic_bullish or hidden_bullish:
+        levels = compute_stop_and_targets({
+            'pl_price_1': state.pl_price_1,
+            'pl_price_2': state.pl_price_2,
+            'pl_bar_1': state.pl_bar_1,
+            'pl_bar_2': state.pl_bar_2,
+            'ph_price_1': state.ph_price_1,
+            'ph_price_2': state.ph_price_2,
+            'ph_bar_1': state.ph_bar_1,
+            'ph_bar_2': state.ph_bar_2
+        }, "long", closed_df, atr14.iloc[last_i])
+        if levels:
+            target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "long")
+            return "BUY", entry_price, levels["stop"], target
+
+    if classic_bearish or hidden_bearish:
+        levels = compute_stop_and_targets({
+            'pl_price_1': state.pl_price_1,
+            'pl_price_2': state.pl_price_2,
+            'pl_bar_1': state.pl_bar_1,
+            'pl_bar_2': state.pl_bar_2,
+            'ph_price_1': state.ph_price_1,
+            'ph_price_2': state.ph_price_2,
+            'ph_bar_1': state.ph_bar_1,
+            'ph_bar_2': state.ph_bar_2
+        }, "short", closed_df, atr14.iloc[last_i])
+        if levels:
+            target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "short")
+            return "SELL", entry_price, levels["stop"], target
+
+    return None, None, None, None
 
 # =====================================================================================
 # تابع اصلی تحلیل و ارسال سیگنال
 # =====================================================================================
 def analyze_and_send():
-    """دریافت داده، تحلیل و ارسال سیگنال به تلگرام"""
+    """دریافت داده، تحلیل و ارسال سیگنال به تلگرام با نقاط ورود، استاپ و تارگت"""
     data = TrueTradeData()
     symbols = ["LTCUSDT", "DOGEUSDT", "ETHUSDT"]
+    
+    # وضعیت هر نماد (برای نگهداری قله‌ها و کف‌ها)
+    states = {symbol: SymbolState() for symbol in symbols}
     
     for symbol in symbols:
         try:
@@ -201,21 +382,30 @@ def analyze_and_send():
                 print(f"[SKIP] {symbol}: داده‌ای دریافت نشد")
                 continue
             
-            # لاگ تأیید دریافت داده
             print(f"[DATA] {symbol}: {len(df)} کندل دریافت شد")
             
-            signal = detect_divergence(df)
-            if signal != 'NONE':
+            signal, entry_price, stop_loss, take_profit = detect_signal(df, states[symbol])
+            
+            if signal is not None:
                 iran_time = format_iran_time()
+                
+                # تعیین جهت سیگنال
+                direction_text = "🟢 خرید (BUY)" if signal == "BUY" else "🔴 فروش (SELL)"
+                direction_emoji = "🟢" if signal == "BUY" else "🔴"
+                
                 message = f"📊 **سیگنال معاملاتی - ربات سیگنال‌دهی**\n"
                 message += f"🔹 **نماد:** {symbol}\n"
-                message += f"🔸 **نوع:** {'🟢 خرید (BUY)' if signal == 'BUY' else '🔴 فروش (SELL)'}\n"
+                message += f"🔸 **نوع:** {direction_text}\n"
                 message += f"💰 **قیمت فعلی:** {df['close'].iloc[-1]:.4f}\n"
+                message += f"📍 **نقطه ورود:** {entry_price:.4f}\n"
+                message += f"🛑 **حد ضرر (Stop Loss):** {stop_loss:.4f}\n"
+                message += f"🎯 **حد سود (Take Profit):** {take_profit:.4f}\n"
                 message += f"🕒 **زمان ایران:** {iran_time}\n"
                 message += f"📊 **استراتژی:** DTM Divergence\n"
                 message += f"🤖 **ربات:** SignalBot (فقط سیگنال، بدون معامله)"
+                
                 send_telegram_message(message)
-                print(f"[SIGNAL] {symbol}: {signal} at {df['close'].iloc[-1]}")
+                print(f"[SIGNAL] {symbol}: {signal} | Entry: {entry_price:.4f} | SL: {stop_loss:.4f} | TP: {take_profit:.4f}")
             else:
                 print(f"[ANALYSIS] {symbol}: بدون سیگنال")
                 
