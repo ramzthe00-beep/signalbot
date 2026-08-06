@@ -201,17 +201,23 @@ def analyze_and_send():
                 print(f"[SKIP] {symbol}: داده‌ای دریافت نشد")
                 continue
             
+            # لاگ تأیید دریافت داده
+            print(f"[DATA] {symbol}: {len(df)} کندل دریافت شد")
+            
             signal = detect_divergence(df)
             if signal != 'NONE':
                 iran_time = format_iran_time()
-                message = f"🔔 **سیگنال معاملاتی**\n"
+                message = f"📊 **سیگنال معاملاتی - ربات سیگنال‌دهی**\n"
                 message += f"🔹 **نماد:** {symbol}\n"
                 message += f"🔸 **نوع:** {'🟢 خرید (BUY)' if signal == 'BUY' else '🔴 فروش (SELL)'}\n"
                 message += f"💰 **قیمت فعلی:** {df['close'].iloc[-1]:.4f}\n"
                 message += f"🕒 **زمان ایران:** {iran_time}\n"
-                message += f"📊 **استراتژی:** DTM Divergence"
+                message += f"📊 **استراتژی:** DTM Divergence\n"
+                message += f"🤖 **ربات:** SignalBot (فقط سیگنال، بدون معامله)"
                 send_telegram_message(message)
                 print(f"[SIGNAL] {symbol}: {signal} at {df['close'].iloc[-1]}")
+            else:
+                print(f"[ANALYSIS] {symbol}: بدون سیگنال")
                 
         except Exception as e:
             print(f"[ERROR] {symbol}: {e}")
@@ -221,14 +227,11 @@ def analyze_and_send():
 # =====================================================================================
 def signal_loop():
     """حلقه بررسی مداوم"""
-    last_signal_time = {}
-    
     while True:
         try:
-            # تحلیل و ارسال سیگنال
+            print("[LOOP] شروع یک دور جدید بررسی...")
             analyze_and_send()
-            
-            # هر ۱ دقیقه یک بار بررسی کن
+            print("[LOOP] پایان دور بررسی، ۶۰ ثانیه مکث...")
             time.sleep(60)
             
         except Exception as e:
@@ -252,7 +255,7 @@ def run_flask():
 # =====================================================================================
 if __name__ == "__main__":
     # ارسال پیام استارت
-    send_telegram_message("🤖 **ربات سیگنال‌دهی DTM راه‌اندازی شد!**\n📊 در حال دریافت داده و تحلیل بازار...")
+    send_telegram_message("🤖 **ربات سیگنال‌دهی DTM (SignalBot) راه‌اندازی شد!**\n📊 در حال دریافت داده و تحلیل بازار...\n⚠️ **توجه:** این ربات فقط سیگنال ارسال می‌کند و هیچ معامله‌ای انجام نمی‌دهد.")
     
     # اجرای Flask در یک ترد جداگانه
     flask_thread = threading.Thread(target=run_flask, daemon=True)
