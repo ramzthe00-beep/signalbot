@@ -4,6 +4,8 @@ Signal Bot Pro - TheTrueTrade
 ====================================================================
 ربات سیگنال‌دهی پیشرفته با سیستم امتیازدهی ۳ سطحی (سبز، زرد، سفید)
 بر اساس واگرایی RSI، MACD، هیستوگرام، فیبوناچی و پرایس‌اکشن
+با قابلیت نمایش وضعیت و قابلیت‌های فعال در هر بار راه‌اندازی
+و حافظه ۱۰۰ Pivot اخیر با گزارش هر ۱ ساعت
 """
 
 import time
@@ -212,7 +214,6 @@ def detect_fibonacci_retracement(pivot1_price, pivot2_price, current_price):
         '0.786': pivot1_price + 0.786 * diff
     }
     
-    # بررسی نزدیک بودن قیمت فعلی به سطح ۰.۶۱۸ یا ۰.۷۸۶ (با تلرانس ۰.۵%)
     tolerance = 0.005
     for level_name, level_price in levels.items():
         if level_name in ['0.618', '0.786']:
@@ -228,14 +229,12 @@ def detect_price_action(df, direction):
     last = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # کندل بزرگ (حداقل ۲ برابر میانگین)
     avg_range = (df['high'] - df['low']).rolling(10).mean().iloc[-1]
     candle_range = last['high'] - last['low']
     
     if candle_range > avg_range * 2:
         return True
     
-    # Pin Bar
     body = abs(last['close'] - last['open'])
     upper_wick = last['high'] - max(last['open'], last['close'])
     lower_wick = min(last['open'], last['close']) - last['low']
@@ -247,7 +246,6 @@ def detect_price_action(df, direction):
         if upper_wick > body * 2 and lower_wick < body * 0.5:
             return True
     
-    # Engulfing
     if direction == "BUY":
         if last['close'] > last['open'] and prev['close'] < prev['open'] and last['close'] > prev['open'] and last['open'] < prev['close']:
             return True
@@ -258,14 +256,9 @@ def detect_price_action(df, direction):
     return False
 
 def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
-    """
-    محاسبه امتیاز واگرایی بر اساس ۵ معیار
-    بازگشت: (score, details)
-    """
     score = 0
     details = []
     
-    # 1. RSI واگرایی
     if direction == "BUY":
         if pivot2['price'] < pivot1['price'] and pivot2['rsi'] > pivot1['rsi']:
             score += 1
@@ -275,7 +268,7 @@ def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
             details.append("✅ RSI واگرایی (مخفی)")
         else:
             details.append("❌ RSI واگرایی ندارد")
-    else:  # SELL
+    else:
         if pivot2['price'] > pivot1['price'] and pivot2['rsi'] < pivot1['rsi']:
             score += 1
             details.append("✅ RSI واگرایی")
@@ -285,7 +278,6 @@ def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
         else:
             details.append("❌ RSI واگرایی ندارد")
     
-    # 2. خط MACD واگرایی
     if direction == "BUY":
         if pivot2['price'] < pivot1['price'] and pivot2['macdline'] > pivot1['macdline']:
             score += 1
@@ -295,7 +287,7 @@ def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
             details.append("✅ خط MACD واگرایی (مخفی)")
         else:
             details.append("❌ خط MACD واگرایی ندارد")
-    else:  # SELL
+    else:
         if pivot2['price'] > pivot1['price'] and pivot2['macdline'] < pivot1['macdline']:
             score += 1
             details.append("✅ خط MACD واگرایی")
@@ -305,20 +297,18 @@ def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
         else:
             details.append("❌ خط MACD واگرایی ندارد")
     
-    # 3. هیستوگرام MACD واگرایی + تغییر رنگ
     hist_divergence = False
     if direction == "BUY":
         if pivot2['price'] < pivot1['price'] and pivot2['hist'] > pivot1['hist']:
             hist_divergence = True
         elif pivot2['price'] > pivot1['price'] and pivot2['hist'] < pivot1['hist']:
             hist_divergence = True
-    else:  # SELL
+    else:
         if pivot2['price'] > pivot1['price'] and pivot2['hist'] < pivot1['hist']:
             hist_divergence = True
         elif pivot2['price'] < pivot1['price'] and pivot2['hist'] > pivot1['hist']:
             hist_divergence = True
     
-    # بررسی تغییر رنگ هیستوگرام
     color_changed = (pivot1['hist'] < 0 and pivot2['hist'] > 0) or (pivot1['hist'] > 0 and pivot2['hist'] < 0)
     
     if hist_divergence and color_changed:
@@ -329,7 +319,6 @@ def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
     else:
         details.append("❌ هیستوگرام MACD واگرایی ندارد")
     
-    # 4. فیبوناچی
     fib_level = detect_fibonacci_retracement(pivot1['price'], pivot2['price'], current_price)
     if fib_level:
         score += 1
@@ -337,7 +326,6 @@ def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
     else:
         details.append("❌ فیبوناچی ندارد")
     
-    # 5. کندل تأییدیه پرایس‌اکشن
     pa_signal = detect_price_action(df, direction)
     if pa_signal:
         score += 1
@@ -348,7 +336,6 @@ def calculate_divergence_score(pivot1, pivot2, direction, df, current_price):
     return score, details
 
 def classify_signal(score, details, direction):
-    """طبقه‌بندی سیگنال بر اساس امتیاز"""
     if score >= 5:
         return "🟢", "ایده‌آل (Ideal)", score, details
     elif score >= 4:
@@ -359,12 +346,12 @@ def classify_signal(score, details, direction):
         return None, None, score, details
 
 # =====================================================================================
-# کلاس وضعیت (برای نگهداری قله‌ها و کف‌ها)
+# کلاس وضعیت (با حافظه ۱۰۰ Pivot)
 # =====================================================================================
 class SymbolState:
     def __init__(self):
-        self.pivot_highs = []
-        self.pivot_lows = []
+        self.pivot_highs = []  # لیست برای ذخیره ۱۰۰ Pivot High
+        self.pivot_lows = []   # لیست برای ذخیره ۱۰۰ Pivot Low
         self.last_processed_bar = 0
         self.alert_sent = False
 
@@ -395,142 +382,7 @@ def update_trade_result(symbol, signal_time, result, price):
     save_history(history)
 
 # =====================================================================================
-# تابع تشخیص سیگنال با سیستم امتیازدهی
-# =====================================================================================
-def detect_signal(df, state, symbol):
-    """تشخیص سیگنال با سیستم امتیازدهی ۳ سطحی"""
-    closed_df = df.iloc[:-1].reset_index(drop=True)
-    n = len(closed_df)
-    if n < 5 + 3 + 20 + 5:
-        return None, None, None, None, False, None, None, None
-
-    close = closed_df["close"]
-    high = closed_df["high"]
-    low = closed_df["low"]
-
-    rsi_val = calc_rsi(close, 14)
-    macd_line, signal_line, hist_line = calc_macd(close, 12, 26, 9)
-    atr14 = calc_atr(high, low, close, 14)
-    pivot_high = find_pivot_high(high, 5, 3)
-    pivot_low = find_pivot_low(low, 5, 3)
-
-    last_i = n - 1
-    
-    # پیدا کردن همه Pivotهای جدید از آخرین پردازش
-    new_pivots_high = []
-    new_pivots_low = []
-    
-    start_bar = state.last_processed_bar
-    for i in range(start_bar, last_i + 1):
-        if not pd.isna(pivot_high.iloc[i]):
-            new_pivots_high.append({
-                'price': pivot_high.iloc[i],
-                'bar': i,
-                'rsi': rsi_val.iloc[i],
-                'macdline': macd_line.iloc[i],
-                'hist': hist_line.iloc[i]
-            })
-        if not pd.isna(pivot_low.iloc[i]):
-            new_pivots_low.append({
-                'price': pivot_low.iloc[i],
-                'bar': i,
-                'rsi': rsi_val.iloc[i],
-                'macdline': macd_line.iloc[i],
-                'hist': hist_line.iloc[i]
-            })
-    
-    state.last_processed_bar = last_i + 1
-    state.pivot_highs.extend(new_pivots_high)
-    state.pivot_lows.extend(new_pivots_low)
-    
-    if len(state.pivot_highs) > 50:
-        state.pivot_highs = state.pivot_highs[-50:]
-    if len(state.pivot_lows) > 50:
-        state.pivot_lows = state.pivot_lows[-50:]
-    
-    # هشدار زودهنگام
-    early_signal = False
-    if len(new_pivots_high) > 0 or len(new_pivots_low) > 0:
-        early_signal = True
-    
-    entry_price = close.iloc[last_i]
-    current_price = df['close'].iloc[-1]
-    
-    # بررسی سیگنال خرید (کلاسیک و مخفی)
-    buy_signal = None
-    sell_signal = None
-    
-    if len(state.pivot_lows) >= 2:
-        pl_1 = state.pivot_lows[-2]
-        pl_2 = state.pivot_lows[-1]
-        
-        # شرط قیمت برای واگرایی کلاسیک خرید
-        classic_price_lower = pl_2['price'] < pl_1['price']
-        # شرط قیمت برای واگرایی مخفی خرید
-        hidden_price_higher = pl_2['price'] > pl_1['price']
-        
-        # بررسی وجود حداقل یکی از دو شرط
-        if classic_price_lower or hidden_price_higher:
-            # بررسی روند
-            trend_ok_bullish = is_trending_down(close, pl_1['bar'], 20, 0.05)
-            
-            if trend_ok_bullish:
-                score, details = calculate_divergence_score(pl_1, pl_2, "BUY", df, current_price)
-                emoji, label, final_score, _ = classify_signal(score, details, "BUY")
-                
-                if emoji is not None and final_score >= 3:  # حداقل امتیاز ۳
-                    # محاسبه استاپ و تارگت
-                    levels = compute_stop_and_targets({
-                        'pl_price_1': pl_1['price'],
-                        'pl_price_2': pl_2['price'],
-                        'pl_bar_1': pl_1['bar'],
-                        'pl_bar_2': pl_2['bar'],
-                        'ph_price_1': None,
-                        'ph_price_2': None,
-                        'ph_bar_1': None,
-                        'ph_bar_2': None
-                    }, "long", closed_df, atr14.iloc[last_i])
-                    
-                    if levels:
-                        target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "long")
-                        return "BUY", entry_price, levels["stop"], target, early_signal, emoji, label, final_score
-    
-    if len(state.pivot_highs) >= 2:
-        ph_1 = state.pivot_highs[-2]
-        ph_2 = state.pivot_highs[-1]
-        
-        # شرط قیمت برای واگرایی کلاسیک فروش
-        classic_price_higher = ph_2['price'] > ph_1['price']
-        # شرط قیمت برای واگرایی مخفی فروش
-        hidden_price_lower = ph_2['price'] < ph_1['price']
-        
-        if classic_price_higher or hidden_price_lower:
-            trend_ok_bearish = is_trending_up(close, ph_1['bar'], 20, 0.05)
-            
-            if trend_ok_bearish:
-                score, details = calculate_divergence_score(ph_1, ph_2, "SELL", df, current_price)
-                emoji, label, final_score, _ = classify_signal(score, details, "SELL")
-                
-                if emoji is not None and final_score >= 3:
-                    levels = compute_stop_and_targets({
-                        'pl_price_1': None,
-                        'pl_price_2': None,
-                        'pl_bar_1': None,
-                        'pl_bar_2': None,
-                        'ph_price_1': ph_1['price'],
-                        'ph_price_2': ph_2['price'],
-                        'ph_bar_1': ph_1['bar'],
-                        'ph_bar_2': ph_2['bar']
-                    }, "short", closed_df, atr14.iloc[last_i])
-                    
-                    if levels:
-                        target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "short")
-                        return "SELL", entry_price, levels["stop"], target, early_signal, emoji, label, final_score
-    
-    return None, None, None, None, early_signal, None, None, None
-
-# =====================================================================================
-# توابع کمکی (از پروژه قبلی)
+# توابع کمکی برای محاسبه استاپ و تارگت
 # =====================================================================================
 def compute_stop_and_targets(state, direction, df, atr_val):
     if direction == "long":
@@ -573,6 +425,187 @@ def resolve_final_target(entry_price: float, stop_price: float, tp1_raw: float, 
         return entry_price + risk_dist * min_rr_ratio
     else:
         return entry_price - risk_dist * min_rr_ratio
+
+# =====================================================================================
+# تابع تشخیص سیگنال با سیستم امتیازدهی و حافظه ۱۰۰ Pivot
+# =====================================================================================
+def detect_signal(df, state, symbol):
+    closed_df = df.iloc[:-1].reset_index(drop=True)
+    n = len(closed_df)
+    if n < 5 + 3 + 20 + 5:
+        return None, None, None, None, False, None, None, None
+
+    close = closed_df["close"]
+    high = closed_df["high"]
+    low = closed_df["low"]
+
+    rsi_val = calc_rsi(close, 14)
+    macd_line, signal_line, hist_line = calc_macd(close, 12, 26, 9)
+    atr14 = calc_atr(high, low, close, 14)
+    pivot_high = find_pivot_high(high, 5, 3)
+    pivot_low = find_pivot_low(low, 5, 3)
+
+    last_i = n - 1
+    
+    # پیدا کردن همه Pivotهای جدید از آخرین پردازش
+    new_pivots_high = []
+    new_pivots_low = []
+    
+    start_bar = state.last_processed_bar
+    for i in range(start_bar, last_i + 1):
+        if not pd.isna(pivot_high.iloc[i]):
+            new_pivots_high.append({
+                'price': pivot_high.iloc[i],
+                'bar': i,
+                'rsi': rsi_val.iloc[i],
+                'macdline': macd_line.iloc[i],
+                'hist': hist_line.iloc[i]
+            })
+        if not pd.isna(pivot_low.iloc[i]):
+            new_pivots_low.append({
+                'price': pivot_low.iloc[i],
+                'bar': i,
+                'rsi': rsi_val.iloc[i],
+                'macdline': macd_line.iloc[i],
+                'hist': hist_line.iloc[i]
+            })
+    
+    state.last_processed_bar = last_i + 1
+    
+    # اضافه کردن Pivotهای جدید به تاریخچه
+    state.pivot_highs.extend(new_pivots_high)
+    state.pivot_lows.extend(new_pivots_low)
+    
+    # محدود کردن تاریخچه به ۱۰۰ Pivot اخیر
+    if len(state.pivot_highs) > 100:
+        state.pivot_highs = state.pivot_highs[-100:]
+    if len(state.pivot_lows) > 100:
+        state.pivot_lows = state.pivot_lows[-100:]
+    
+    # هشدار زودهنگام
+    early_signal = False
+    if len(new_pivots_high) > 0 or len(new_pivots_low) > 0:
+        early_signal = True
+    
+    entry_price = close.iloc[last_i]
+    current_price = df['close'].iloc[-1]
+    
+    # بررسی سیگنال خرید (کلاسیک و مخفی)
+    if len(state.pivot_lows) >= 2:
+        pl_1 = state.pivot_lows[-2]
+        pl_2 = state.pivot_lows[-1]
+        
+        classic_price_lower = pl_2['price'] < pl_1['price']
+        hidden_price_higher = pl_2['price'] > pl_1['price']
+        
+        if classic_price_lower or hidden_price_higher:
+            trend_ok_bullish = is_trending_down(close, pl_1['bar'], 20, 0.05)
+            
+            if trend_ok_bullish:
+                score, details = calculate_divergence_score(pl_1, pl_2, "BUY", df, current_price)
+                emoji, label, final_score, _ = classify_signal(score, details, "BUY")
+                
+                if emoji is not None and final_score >= 3:
+                    levels = compute_stop_and_targets({
+                        'pl_price_1': pl_1['price'],
+                        'pl_price_2': pl_2['price'],
+                        'pl_bar_1': pl_1['bar'],
+                        'pl_bar_2': pl_2['bar'],
+                        'ph_price_1': None,
+                        'ph_price_2': None,
+                        'ph_bar_1': None,
+                        'ph_bar_2': None
+                    }, "long", closed_df, atr14.iloc[last_i])
+                    
+                    if levels:
+                        target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "long")
+                        return "BUY", entry_price, levels["stop"], target, early_signal, emoji, label, final_score
+    
+    # بررسی سیگنال فروش (کلاسیک و مخفی)
+    if len(state.pivot_highs) >= 2:
+        ph_1 = state.pivot_highs[-2]
+        ph_2 = state.pivot_highs[-1]
+        
+        classic_price_higher = ph_2['price'] > ph_1['price']
+        hidden_price_lower = ph_2['price'] < ph_1['price']
+        
+        if classic_price_higher or hidden_price_lower:
+            trend_ok_bearish = is_trending_up(close, ph_1['bar'], 20, 0.05)
+            
+            if trend_ok_bearish:
+                score, details = calculate_divergence_score(ph_1, ph_2, "SELL", df, current_price)
+                emoji, label, final_score, _ = classify_signal(score, details, "SELL")
+                
+                if emoji is not None and final_score >= 3:
+                    levels = compute_stop_and_targets({
+                        'pl_price_1': None,
+                        'pl_price_2': None,
+                        'pl_bar_1': None,
+                        'pl_bar_2': None,
+                        'ph_price_1': ph_1['price'],
+                        'ph_price_2': ph_2['price'],
+                        'ph_bar_1': ph_1['bar'],
+                        'ph_bar_2': ph_2['bar']
+                    }, "short", closed_df, atr14.iloc[last_i])
+                    
+                    if levels:
+                        target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "short")
+                        return "SELL", entry_price, levels["stop"], target, early_signal, emoji, label, final_score
+    
+    return None, None, None, None, early_signal, None, None, None
+
+# =====================================================================================
+# تابع گزارش وضعیت حافظه Pivot
+# =====================================================================================
+def send_pivot_memory_report(states):
+    """ارسال گزارش وضعیت حافظه Pivot برای هر نماد"""
+    try:
+        iran_time = format_iran_time()
+        message = (
+            f"🧠 **گزارش وضعیت حافظه ۱۰۰ Pivot**\n"
+            f"🕒 **زمان ایران:** {iran_time}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        
+        for symbol, state in states.items():
+            high_count = len(state.pivot_highs)
+            low_count = len(state.pivot_lows)
+            last_bar = state.last_processed_bar
+            
+            # بررسی اینکه آیا حافظه به درستی پر شده است
+            high_status = "✅" if high_count > 0 else "❌"
+            low_status = "✅" if low_count > 0 else "❌"
+            limit_status = "✅" if high_count == 100 or low_count == 100 else "🔄"
+            
+            message += (
+                f"🔹 **نماد {symbol}:**\n"
+                f"   • تعداد Pivot High ذخیره‌شده: {high_count} {high_status}\n"
+                f"   • تعداد Pivot Low ذخیره‌شده: {low_count} {low_status}\n"
+                f"   • آخرین بار پردازش‌شده: {last_bar}\n"
+                f"   • وضعیت محدودیت ۱۰۰: {limit_status}\n"
+                f"   • جدیدترین Pivot High: {state.pivot_highs[-1] if state.pivot_highs else 'ندارد'}\n"
+                f"   • جدیدترین Pivot Low: {state.pivot_lows[-1] if state.pivot_lows else 'ندارد'}\n"
+            )
+        
+        # بررسی کلی
+        total_highs = sum(len(s.pivot_highs) for s in states.values())
+        total_lows = sum(len(s.pivot_lows) for s in states.values())
+        
+        message += (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 **جمع کل Pivotهای ذخیره‌شده:**\n"
+            f"   • Pivot High: {total_highs}\n"
+            f"   • Pivot Low: {total_lows}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 **وضعیت کلی:**\n"
+            f"   • {'✅ حافظه به درستی در حال پر شدن است' if total_highs > 0 or total_lows > 0 else '❌ هیچ Pivotti ذخیره نشده است'}\n"
+            f"   • {'✅ محدودیت ۱۰۰ به درستی اعمال می‌شود' if total_highs <= 300 and total_lows <= 300 else '⚠️ بررسی محدودیت ۱۰۰'}\n"
+        )
+        
+        send_telegram_message(message)
+        print(f"[PIVOT REPORT] گزارش حافظه Pivot ارسال شد - {iran_time}")
+    except Exception as e:
+        print(f"[PIVOT REPORT ERROR] {e}")
 
 # =====================================================================================
 # بررسی نزدیکی به تارگت یا استاپ
@@ -846,6 +879,9 @@ def analyze_and_send():
                 
         except Exception as e:
             print(f"[ERROR] {symbol}: {e}")
+    
+    # بازگرداندن states برای گزارش حافظه Pivot
+    return states
 
 # =====================================================================================
 # حلقه اصلی
@@ -853,11 +889,14 @@ def analyze_and_send():
 def signal_loop():
     last_daily_report = None
     last_monthly_report = None
+    last_status_message_time = 0
+    last_pivot_report_time = 0
+    states = {}  # برای نگهداری وضعیت Pivotها
     
     while True:
         try:
             print("[LOOP] شروع یک دور جدید بررسی...")
-            analyze_and_send()
+            states = analyze_and_send()
             print("[LOOP] پایان دور بررسی، ۶۰ ثانیه مکث...")
             
             today = datetime.now().date()
@@ -868,6 +907,37 @@ def signal_loop():
             if last_monthly_report is None or (datetime.now() - last_monthly_report).days >= 30:
                 send_monthly_report()
                 last_monthly_report = datetime.now()
+            
+            current_time = time.time()
+            
+            # ارسال گزارش وضعیت قابلیت‌ها هر ۲۴ ساعت
+            if current_time - last_status_message_time >= 86400:
+                capabilities_message = (
+                    "🔧 **قابلیت‌های فعال در ربات سیگنال‌دهی:**\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "• 📊 دریافت داده از راه عمومی (فعال)\n"
+                    "• 🧠 تشخیص سیگنال با استراتژی DTM (فعال)\n"
+                    "• 🟢🟡⚪ سیستم امتیازدهی ۳ سطحی (فعال)\n"
+                    "• 📈 فیبوناچی و پرایس‌اکشن (فعال)\n"
+                    "• 🔔 هشدار آماده باش ۲ دقیقه قبل از سیگنال (فعال)\n"
+                    "• 🎯 پیگیری تارگت/استاپ (فعال)\n"
+                    "• 📅 گزارش‌های روزانه و ماهانه (فعال)\n"
+                    "• ⚡ هشدار نزدیکی به تارگت/استاپ (فعال)\n"
+                    "• 💾 حافظه ۱۰۰ Pivot اخیر (فعال)\n"
+                    "• 📊 گزارش هر ۱ ساعت از وضعیت حافظه Pivot (فعال)\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕒 **زمان ایران:** {format_iran_time()}\n"
+                    "📌 **وضعیت:** ربات در حال دریافت داده و تحلیل بازار است."
+                )
+                send_telegram_message(capabilities_message)
+                last_status_message_time = current_time
+                print("[STATUS] پیام وضعیت قابلیت‌ها ارسال شد.")
+            
+            # ✅ ارسال گزارش حافظه Pivot هر ۱ ساعت
+            if current_time - last_pivot_report_time >= 3600 and states:
+                send_pivot_memory_report(states)
+                last_pivot_report_time = current_time
+                print("[PIVOT REPORT] گزارش حافظه Pivot ارسال شد (هر ۱ ساعت).")
             
             time.sleep(60)
             
@@ -902,7 +972,10 @@ if __name__ == "__main__":
         "• پرایس‌اکشن (Pin Bar، Engulfing، کندل بزرگ)\n"
         "• هشدار آماده باش ۲ دقیقه قبل از سیگنال\n"
         "• پیگیری تارگت/استاپ\n"
-        "• گزارش‌های روزانه و ماهانه"
+        "• گزارش‌های روزانه و ماهانه\n"
+        "• ارسال گزارش وضعیت قابلیت‌ها هر ۲۴ ساعت\n"
+        "• حافظه ۱۰۰ Pivot اخیر برای تحلیل دقیق‌تر\n"
+        "• **گزارش هر ۱ ساعت از وضعیت حافظه ۱۰۰ Pivot**"
     )
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
