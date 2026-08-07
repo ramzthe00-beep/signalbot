@@ -3,6 +3,7 @@
 Signal Bot Pro - TheTrueTrade
 ====================================================================
 ربات سیگنال‌دهی پیشرفته با هشدارهای هوشمند، پیگیری معاملات و گزارش‌های دوره‌ای
+با قابلیت ذخیره و بررسی ۵۰ Pivot اخیر
 """
 
 import time
@@ -242,24 +243,18 @@ def resolve_final_target(entry_price: float, stop_price: float, tp1_raw: float, 
         return entry_price - risk_dist * min_rr_ratio
 
 # =====================================================================================
-# کلاس وضعیت (برای نگهداری قله‌ها و کف‌ها)
+# کلاس وضعیت (برای نگهداری قله‌ها و کف‌ها - نسخه جدید با ۵۰ Pivot)
 # =====================================================================================
 class SymbolState:
     def __init__(self):
-        self.ph_price_2 = self.ph_price_1 = None
-        self.ph_bar_2 = self.ph_bar_1 = None
-        self.ph_rsi_2 = self.ph_rsi_1 = None
-        self.ph_macdline_2 = self.ph_macdline_1 = None
-        self.ph_hist_2 = self.ph_hist_1 = None
-
-        self.pl_price_2 = self.pl_price_1 = None
-        self.pl_bar_2 = self.pl_bar_1 = None
-        self.pl_rsi_2 = self.pl_rsi_1 = None
-        self.pl_macdline_2 = self.pl_macdline_1 = None
-        self.pl_hist_2 = self.pl_hist_1 = None
+        # لیست تاریخچه Pivotهای High (حداکثر ۵۰ مورد)
+        self.pivot_highs = []  # هر المان: {'price': float, 'bar': int, 'rsi': float, 'macdline': float, 'hist': float}
+        self.pivot_lows = []   # هر المان: {'price': float, 'bar': int, 'rsi': float, 'macdline': float, 'hist': float}
         
-        # برای تشخیص سیگنال نزدیک
-        self.last_check_price = None
+        # آخرین باری که Pivotها پردازش شده‌اند
+        self.last_processed_bar = 0
+        
+        # برای هشدار آماده باش
         self.alert_sent = False
 
 # =====================================================================================
@@ -292,10 +287,10 @@ def update_trade_result(symbol, signal_time, result, price):
     save_history(history)
 
 # =====================================================================================
-# تابع تشخیص سیگنال کامل (با قابلیت هشدار زودهنگام)
+# تابع تشخیص سیگنال کامل (با بررسی همه Pivotهای جدید)
 # =====================================================================================
 def detect_signal(df, state, symbol):
-    """تشخیص سیگنال با هشدار زودهنگام در RIGHT_BARS=2"""
+    """تشخیص سیگنال با بررسی همه Pivotهای جدید از آخرین پردازش"""
     closed_df = df.iloc[:-1].reset_index(drop=True)
     n = len(closed_df)
     if n < 5 + 3 + 20 + 5:
@@ -312,107 +307,205 @@ def detect_signal(df, state, symbol):
     pivot_low = find_pivot_low(low, 5, 3)
 
     last_i = n - 1
-    pivot_check_i = last_i - 3
     
-    # هشدار زودهنگام (در RIGHT_BARS=2)
-    early_check_i = last_i - 2
+    # ✅ پیدا کردن همه Pivotهای جدید از آخرین پردازش
+    new_pivots_high = []
+    new_pivots_low = []
+    
+    start_bar = state.last_processed_bar
+    for i in range(start_bar, last_i + 1):
+        if not pd.isna(pivot_high.iloc[i]):
+            new_pivots_high.append({
+                'price': pivot_high.iloc[i],
+                'bar': i,
+                'rsi': rsi_val.iloc[i],
+                'macdline': macd_line.iloc[i],
+                'hist': hist_line.iloc[i]
+            })
+        if not pd.isna(pivot_low.iloc[i]):
+            new_pivots_low.append({
+                'price': pivot_low.iloc[i],
+                'bar': i,
+                'rsi': rsi_val.iloc[i],
+                'macdline': macd_line.iloc[i],
+                'hist': hist_line.iloc[i]
+            })
+    
+    # به‌روزرسانی آخرین بار پردازش‌شده
+    state.last_processed_bar = last_i + 1
+    
+    # اضافه کردن Pivotهای جدید به تاریخچه
+    state.pivot_highs.extend(new_pivots_high)
+    state.pivot_lows.extend(new_pivots_low)
+    
+    # محدود کردن تاریخچه به ۵۰ Pivot اخیر
+    if len(state.pivot_highs) > 50:
+        state.pivot_highs = state.pivot_highs[-50:]
+    if len(state.pivot_lows) > 50:
+        state.pivot_lows = state.pivot_lows[-50:]
+    
+    # هشدار زودهنگام (اگر Pivot جدیدی در ۲ بار آخر وجود داشته باشد)
     early_signal = False
+    if len(new_pivots_high) > 0 or len(new_pivots_low) > 0:
+        early_signal = True
     
-    if early_check_i >= 5:
-        early_high = not pd.isna(pivot_high.iloc[early_check_i])
-        early_low = not pd.isna(pivot_low.iloc[early_check_i])
-        if early_high or early_low:
-            early_signal = True
-
-    if pivot_check_i < 5:
-        return None, None, None, None, early_signal
-
-    new_pivot_high = not pd.isna(pivot_high.iloc[pivot_check_i])
-    new_pivot_low = not pd.isna(pivot_low.iloc[pivot_check_i])
-
-    if new_pivot_high:
-        state.ph_price_1, state.ph_bar_1 = state.ph_price_2, state.ph_bar_2
-        state.ph_rsi_1, state.ph_macdline_1, state.ph_hist_1 = state.ph_rsi_2, state.ph_macdline_2, state.ph_hist_2
-        state.ph_price_2 = pivot_high.iloc[pivot_check_i]
-        state.ph_bar_2 = pivot_check_i
-        state.ph_rsi_2 = rsi_val.iloc[pivot_check_i]
-        state.ph_macdline_2 = macd_line.iloc[pivot_check_i]
-        state.ph_hist_2 = hist_line.iloc[pivot_check_i]
-
-    if new_pivot_low:
-        state.pl_price_1, state.pl_bar_1 = state.pl_price_2, state.pl_bar_2
-        state.pl_rsi_1, state.pl_macdline_1, state.pl_hist_1 = state.pl_rsi_2, state.pl_macdline_2, state.pl_hist_2
-        state.pl_price_2 = pivot_low.iloc[pivot_check_i]
-        state.pl_bar_2 = pivot_check_i
-        state.pl_rsi_2 = rsi_val.iloc[pivot_check_i]
-        state.pl_macdline_2 = macd_line.iloc[pivot_check_i]
-        state.pl_hist_2 = hist_line.iloc[pivot_check_i]
-
-    macd_color_changed_highs = check_color_change(hist_line, state.ph_bar_1, state.ph_bar_2, True) if new_pivot_high and state.ph_bar_1 is not None else False
-    macd_color_changed_lows = check_color_change(hist_line, state.pl_bar_1, state.pl_bar_2, False) if new_pivot_low and state.pl_bar_1 is not None else False
-
-    trend_ok_bearish = is_trending_up(close, state.ph_bar_1, 20, 0.05) if new_pivot_high and state.ph_bar_1 is not None else False
-    trend_ok_bullish = is_trending_down(close, state.pl_bar_1, 20, 0.05) if new_pivot_low and state.pl_bar_1 is not None else False
-
-    price_higher_high = new_pivot_high and state.ph_price_1 is not None and state.ph_price_2 > state.ph_price_1
-    rsi_lower_high = new_pivot_high and state.ph_rsi_1 is not None and state.ph_rsi_2 < state.ph_rsi_1
-    macdline_lower_high = new_pivot_high and state.ph_macdline_1 is not None and state.ph_macdline_2 < state.ph_macdline_1
-    hist_lower_high = new_pivot_high and state.ph_hist_1 is not None and state.ph_hist_2 < state.ph_hist_1
-    both_peaks_green = new_pivot_high and state.ph_hist_1 is not None and state.ph_hist_1 > 0 and state.ph_hist_2 > 0
+    # =================================================================================
+    # بررسی سیگنال بر اساس دو Pivot آخر (سازگار با کد قبلی)
+    # =================================================================================
+    
+    # متغیرهای مربوط به Pivot High
+    ph_price_1 = None
+    ph_bar_1 = None
+    ph_rsi_1 = None
+    ph_macdline_1 = None
+    ph_hist_1 = None
+    ph_price_2 = None
+    ph_bar_2 = None
+    ph_rsi_2 = None
+    ph_macdline_2 = None
+    ph_hist_2 = None
+    
+    # متغیرهای مربوط به Pivot Low
+    pl_price_1 = None
+    pl_bar_1 = None
+    pl_rsi_1 = None
+    pl_macdline_1 = None
+    pl_hist_1 = None
+    pl_price_2 = None
+    pl_bar_2 = None
+    pl_rsi_2 = None
+    pl_macdline_2 = None
+    pl_hist_2 = None
+    
+    # اگر حداقل ۲ Pivot High در تاریخچه وجود داشته باشد
+    if len(state.pivot_highs) >= 2:
+        ph_1 = state.pivot_highs[-2]
+        ph_2 = state.pivot_highs[-1]
+        ph_price_1 = ph_1['price']
+        ph_bar_1 = ph_1['bar']
+        ph_rsi_1 = ph_1['rsi']
+        ph_macdline_1 = ph_1['macdline']
+        ph_hist_1 = ph_1['hist']
+        ph_price_2 = ph_2['price']
+        ph_bar_2 = ph_2['bar']
+        ph_rsi_2 = ph_2['rsi']
+        ph_macdline_2 = ph_2['macdline']
+        ph_hist_2 = ph_2['hist']
+    
+    # اگر حداقل ۲ Pivot Low در تاریخچه وجود داشته باشد
+    if len(state.pivot_lows) >= 2:
+        pl_1 = state.pivot_lows[-2]
+        pl_2 = state.pivot_lows[-1]
+        pl_price_1 = pl_1['price']
+        pl_bar_1 = pl_1['bar']
+        pl_rsi_1 = pl_1['rsi']
+        pl_macdline_1 = pl_1['macdline']
+        pl_hist_1 = pl_1['hist']
+        pl_price_2 = pl_2['price']
+        pl_bar_2 = pl_2['bar']
+        pl_rsi_2 = pl_2['rsi']
+        pl_macdline_2 = pl_2['macdline']
+        pl_hist_2 = pl_2['hist']
+    
+    # بررسی شرایط واگرایی برای Pivot High
+    price_higher_high = ph_price_2 is not None and ph_price_1 is not None and ph_price_2 > ph_price_1
+    rsi_lower_high = ph_rsi_2 is not None and ph_rsi_1 is not None and ph_rsi_2 < ph_rsi_1
+    macdline_lower_high = ph_macdline_2 is not None and ph_macdline_1 is not None and ph_macdline_2 < ph_macdline_1
+    hist_lower_high = ph_hist_2 is not None and ph_hist_1 is not None and ph_hist_2 < ph_hist_1
+    both_peaks_green = ph_hist_1 is not None and ph_hist_2 is not None and ph_hist_1 > 0 and ph_hist_2 > 0
+    
+    # بررسی تغییر رنگ هیستوگرام برای Pivot High
+    macd_color_changed_highs = False
+    if ph_bar_1 is not None and ph_bar_2 is not None:
+        macd_color_changed_highs = check_color_change(hist_line, ph_bar_1, ph_bar_2, True)
+    
+    # بررسی روند برای Pivot High
+    trend_ok_bearish = False
+    if ph_bar_1 is not None:
+        trend_ok_bearish = is_trending_up(close, ph_bar_1, 20, 0.05)
+    
     classic_bearish = price_higher_high and rsi_lower_high and macdline_lower_high and hist_lower_high and both_peaks_green and macd_color_changed_highs and trend_ok_bearish
-
-    price_lower_low = new_pivot_low and state.pl_price_1 is not None and state.pl_price_2 < state.pl_price_1
-    rsi_higher_low = new_pivot_low and state.pl_rsi_1 is not None and state.pl_rsi_2 > state.pl_rsi_1
-    macdline_higher_low = new_pivot_low and state.pl_macdline_1 is not None and state.pl_macdline_2 > state.pl_macdline_1
-    hist_higher_low = new_pivot_low and state.pl_hist_1 is not None and state.pl_hist_2 > state.pl_hist_1
-    both_troughs_red = new_pivot_low and state.pl_hist_1 is not None and state.pl_hist_1 < 0 and state.pl_hist_2 < 0
+    
+    # بررسی شرایط واگرایی برای Pivot Low
+    price_lower_low = pl_price_2 is not None and pl_price_1 is not None and pl_price_2 < pl_price_1
+    rsi_higher_low = pl_rsi_2 is not None and pl_rsi_1 is not None and pl_rsi_2 > pl_rsi_1
+    macdline_higher_low = pl_macdline_2 is not None and pl_macdline_1 is not None and pl_macdline_2 > pl_macdline_1
+    hist_higher_low = pl_hist_2 is not None and pl_hist_1 is not None and pl_hist_2 > pl_hist_1
+    both_troughs_red = pl_hist_1 is not None and pl_hist_2 is not None and pl_hist_1 < 0 and pl_hist_2 < 0
+    
+    # بررسی تغییر رنگ هیستوگرام برای Pivot Low
+    macd_color_changed_lows = False
+    if pl_bar_1 is not None and pl_bar_2 is not None:
+        macd_color_changed_lows = check_color_change(hist_line, pl_bar_1, pl_bar_2, False)
+    
+    # بررسی روند برای Pivot Low
+    trend_ok_bullish = False
+    if pl_bar_1 is not None:
+        trend_ok_bullish = is_trending_down(close, pl_bar_1, 20, 0.05)
+    
     classic_bullish = price_lower_low and rsi_higher_low and macdline_higher_low and hist_higher_low and both_troughs_red and macd_color_changed_lows and trend_ok_bullish
-
-    price_higher_low = new_pivot_low and state.pl_price_1 is not None and state.pl_price_2 > state.pl_price_1
-    rsi_lower_low = new_pivot_low and state.pl_rsi_1 is not None and state.pl_rsi_2 < state.pl_rsi_1
-    macdline_lower_low = new_pivot_low and state.pl_macdline_1 is not None and state.pl_macdline_2 < state.pl_macdline_1
-    hist_lower_low = new_pivot_low and state.pl_hist_1 is not None and state.pl_hist_2 < state.pl_hist_1
+    
+    # =================================================================================
+    # بررسی واگرایی پنهان
+    # =================================================================================
+    
+    # واگرایی پنهان برای Pivot Low
+    price_higher_low = pl_price_2 is not None and pl_price_1 is not None and pl_price_2 > pl_price_1
+    rsi_lower_low = pl_rsi_2 is not None and pl_rsi_1 is not None and pl_rsi_2 < pl_rsi_1
+    macdline_lower_low = pl_macdline_2 is not None and pl_macdline_1 is not None and pl_macdline_2 < pl_macdline_1
+    hist_lower_low = pl_hist_2 is not None and pl_hist_1 is not None and pl_hist_2 < pl_hist_1
     hidden_bullish = price_higher_low and rsi_lower_low and macdline_lower_low and hist_lower_low and both_troughs_red and macd_color_changed_lows
-
-    price_lower_high = new_pivot_high and state.ph_price_1 is not None and state.ph_price_2 < state.ph_price_1
-    rsi_higher_high = new_pivot_high and state.ph_rsi_1 is not None and state.ph_rsi_2 > state.ph_rsi_1
-    macdline_higher_high = new_pivot_high and state.ph_macdline_1 is not None and state.ph_macdline_2 > state.ph_macdline_1
-    hist_higher_high = new_pivot_high and state.ph_hist_1 is not None and state.ph_hist_2 > state.ph_hist_1
+    
+    # واگرایی پنهان برای Pivot High
+    price_lower_high = ph_price_2 is not None and ph_price_1 is not None and ph_price_2 < ph_price_1
+    rsi_higher_high = ph_rsi_2 is not None and ph_rsi_1 is not None and ph_rsi_2 > ph_rsi_1
+    macdline_higher_high = ph_macdline_2 is not None and ph_macdline_1 is not None and ph_macdline_2 > ph_macdline_1
+    hist_higher_high = ph_hist_2 is not None and ph_hist_1 is not None and ph_hist_2 > ph_hist_1
     hidden_bearish = price_lower_high and rsi_higher_high and macdline_higher_high and hist_higher_high and both_peaks_green and macd_color_changed_highs
-
+    
+    # =================================================================================
+    # تصمیم‌گیری نهایی
+    # =================================================================================
+    
     entry_price = close.iloc[last_i]
     current_price = df['close'].iloc[-1]
-
+    
+    # سیگنال خرید (کلاسیک یا پنهان)
     if classic_bullish or hidden_bullish:
-        levels = compute_stop_and_targets({
-            'pl_price_1': state.pl_price_1,
-            'pl_price_2': state.pl_price_2,
-            'pl_bar_1': state.pl_bar_1,
-            'pl_bar_2': state.pl_bar_2,
-            'ph_price_1': state.ph_price_1,
-            'ph_price_2': state.ph_price_2,
-            'ph_bar_1': state.ph_bar_1,
-            'ph_bar_2': state.ph_bar_2
-        }, "long", closed_df, atr14.iloc[last_i])
-        if levels:
-            target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "long")
-            return "BUY", entry_price, levels["stop"], target, early_signal
-
+        # استفاده از Pivot Low برای محاسبه استاپ و تارگت
+        if pl_bar_1 is not None and pl_bar_2 is not None and pl_price_1 is not None and pl_price_2 is not None:
+            levels = compute_stop_and_targets({
+                'pl_price_1': pl_price_1,
+                'pl_price_2': pl_price_2,
+                'pl_bar_1': pl_bar_1,
+                'pl_bar_2': pl_bar_2,
+                'ph_price_1': ph_price_1,
+                'ph_price_2': ph_price_2,
+                'ph_bar_1': ph_bar_1,
+                'ph_bar_2': ph_bar_2
+            }, "long", closed_df, atr14.iloc[last_i])
+            if levels:
+                target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "long")
+                return "BUY", entry_price, levels["stop"], target, early_signal
+    
+    # سیگنال فروش (کلاسیک یا پنهان)
     if classic_bearish or hidden_bearish:
-        levels = compute_stop_and_targets({
-            'pl_price_1': state.pl_price_1,
-            'pl_price_2': state.pl_price_2,
-            'pl_bar_1': state.pl_bar_1,
-            'pl_bar_2': state.pl_bar_2,
-            'ph_price_1': state.ph_price_1,
-            'ph_price_2': state.ph_price_2,
-            'ph_bar_1': state.ph_bar_1,
-            'ph_bar_2': state.ph_bar_2
-        }, "short", closed_df, atr14.iloc[last_i])
-        if levels:
-            target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "short")
-            return "SELL", entry_price, levels["stop"], target, early_signal
-
+        # استفاده از Pivot High برای محاسبه استاپ و تارگت
+        if ph_bar_1 is not None and ph_bar_2 is not None and ph_price_1 is not None and ph_price_2 is not None:
+            levels = compute_stop_and_targets({
+                'pl_price_1': pl_price_1,
+                'pl_price_2': pl_price_2,
+                'pl_bar_1': pl_bar_1,
+                'pl_bar_2': pl_bar_2,
+                'ph_price_1': ph_price_1,
+                'ph_price_2': ph_price_2,
+                'ph_bar_1': ph_bar_1,
+                'ph_bar_2': ph_bar_2
+            }, "short", closed_df, atr14.iloc[last_i])
+            if levels:
+                target = resolve_final_target(entry_price, levels["stop"], levels["tp1_raw"], "short")
+                return "SELL", entry_price, levels["stop"], target, early_signal
+    
     return None, None, None, None, early_signal
 
 # =====================================================================================
