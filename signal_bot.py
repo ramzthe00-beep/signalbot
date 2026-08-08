@@ -4,6 +4,9 @@ Signal Bot Pro - TheTrueTrade
 ====================================================================
 ربات سیگنال‌دهی پیشرفته - فقط ارسال سیگنال (بدون ترید خودکار)
 نسخه اصلاح شده نهایی - با لاگ کامل تلگرام و پیام‌های اختصاصی
++ محدودیت پیام نزدیکی (آستانه‌های 5%، 3%، 1%، 0.5%)
++ رند کردن قیمت‌ها با ۱۰ رقم اعشار
++ اضافه شدن BNBUSDT, SOLUSDT, PAXGUSDT
 """
 
 import os
@@ -39,6 +42,27 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7402770612")
 BASE_URL = "https://apiv2.thetruetrade.io"
 
 HISTORY_FILE = "trades_history.json"
+
+# =====================================================================================
+# تنظیمات Tick Size و Precision برای هر نماد
+# =====================================================================================
+TICK_SIZES = {
+    "LTCUSDT": 0.01,
+    "DOGEUSDT": 0.00001,
+    "ETHUSDT": 0.01,
+    "BNBUSDT": 0.01,
+    "SOLUSDT": 0.001,
+    "PAXGUSDT": 0.01,
+}
+
+PRICE_PRECISION = {
+    "LTCUSDT": 2,
+    "DOGEUSDT": 5,
+    "ETHUSDT": 2,
+    "BNBUSDT": 2,
+    "SOLUSDT": 3,
+    "PAXGUSDT": 2,
+}
 
 # =====================================================================================
 # کلاس دریافت داده
@@ -101,6 +125,18 @@ def format_iran_date(dt=None):
     if dt is None:
         dt = datetime.now(timezone(timedelta(hours=3, minutes=30)))
     return dt.strftime('%Y-%m-%d')
+
+# =====================================================================================
+# کلاس وضعیت هشدار نزدیکی
+# =====================================================================================
+class ProximityState:
+    def __init__(self):
+        self._last_target_alert = None
+        self._last_stop_alert = None
+        self._target_hit_notified = False
+        self._stop_hit_notified = False
+
+_proximity_states = {}
 
 # =====================================================================================
 # توابع محاسباتی
@@ -170,6 +206,13 @@ def resolve_bar_from_ts(df_indexed, ts):
         return None
     return df_indexed.index.get_loc(ts)
 
+def round_price(price, symbol):
+    """رند کردن قیمت با ۱۰ رقم اعشار و tick size"""
+    precision = PRICE_PRECISION.get(symbol.upper(), 2)
+    tick = TICK_SIZES.get(symbol.upper(), 0.01)
+    rounded = round(price / tick) * tick
+    return round(rounded, precision)
+
 def compute_stop_and_targets(pivot_highs, pivot_lows, direction, df_indexed, atr_val, stop_buffer_pct=0.05):
     if direction == "long":
         if len(pivot_lows) < 2:
@@ -223,7 +266,6 @@ def calculate_divergence_score(p1, p2, direction, df, current_price):
     score = 0
     details = []
 
-    # RSI
     if direction == "BUY":
         if p2['price'] < p1['price'] and p2['rsi'] > p1['rsi']:
             score += 1; details.append("✅ RSI Divergence (Classic)")
@@ -239,7 +281,6 @@ def calculate_divergence_score(p1, p2, direction, df, current_price):
         else:
             details.append("❌ RSI")
 
-    # MACD Line
     if direction == "BUY":
         if p2['price'] < p1['price'] and p2['macdline'] > p1['macdline']:
             score += 1; details.append("✅ MACD Line Divergence")
@@ -255,7 +296,6 @@ def calculate_divergence_score(p1, p2, direction, df, current_price):
         else:
             details.append("❌ MACD Line")
 
-    # Histogram
     hist_div = False
     if direction == "BUY":
         if p2['price'] < p1['price'] and p2['hist'] > p1['hist']:
@@ -276,7 +316,6 @@ def calculate_divergence_score(p1, p2, direction, df, current_price):
     else:
         details.append("❌ MACD Histogram")
 
-    # Fibonacci
     if len(df) > 20:
         h20, l20 = df['high'].iloc[-20:].max(), df['low'].iloc[-20:].min()
         if h20 != l20:
@@ -291,7 +330,6 @@ def calculate_divergence_score(p1, p2, direction, df, current_price):
     else:
         details.append("❌ Fibonacci")
 
-    # Price Action
     if len(df) >= 3:
         last, prev = df.iloc[-1], df.iloc[-2]
         avg_range = (df['high']-df['low']).rolling(10).mean().iloc[-1]
@@ -343,7 +381,7 @@ class SymbolState:
         self.telegram_log_count = 0
         self.last_telegram_log_time = 0
 
-SYMBOLS = ["LTCUSDT", "DOGEUSDT", "ETHUSDT"]
+SYMBOLS = ["LTCUSDT", "DOGEUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "PAXGUSDT"]
 SYMBOL_STATES = {s: SymbolState() for s in SYMBOLS}
 
 # =====================================================================================
@@ -488,7 +526,7 @@ def run_startup_diagnostic():
     logger.info("Startup Diagnostic Complete")
 
 # =====================================================================================
-# تابع تشخیص سیگنال - با لاگ تلگرام
+# تابع تشخیص سیگنال
 # =====================================================================================
 def detect_signal(df, state, symbol, debug=False):
     debug_log = []
@@ -578,7 +616,7 @@ def detect_signal(df, state, symbol, debug=False):
     buy_details = sell_details = []
     buy_signal_type = sell_signal_type = ""
 
-    # BUY CHECK
+    # BUY
     if len(state.pivot_lows) >= 2:
         pl_1, pl_2 = state.pivot_lows[-2], state.pivot_lows[-1]
         bar1 = resolve_bar_from_ts(closed_df_indexed, pl_1['ts'])
@@ -588,7 +626,6 @@ def detect_signal(df, state, symbol, debug=False):
             is_hidden_buy = pl_2['price'] > pl_1['price']
 
             if is_classic_buy or is_hidden_buy:
-                
                 if is_classic_buy:
                     trend_ok = is_trending_down(close, bar1, 20, 0.05)
                     log(f"   🔵 Classic BUY check: bar1={bar1}, trend={'✅' if trend_ok else '❌'}")
@@ -617,7 +654,7 @@ def detect_signal(df, state, symbol, debug=False):
         else:
             log(f"   🔵 BUY: pl_1 ts not in current window")
 
-    # SELL CHECK
+    # SELL
     if len(state.pivot_highs) >= 2:
         ph_1, ph_2 = state.pivot_highs[-2], state.pivot_highs[-1]
         bar1 = resolve_bar_from_ts(closed_df_indexed, ph_1['ts'])
@@ -627,7 +664,6 @@ def detect_signal(df, state, symbol, debug=False):
             is_hidden_sell = ph_2['price'] < ph_1['price']
 
             if is_classic_sell or is_hidden_sell:
-                
                 if is_classic_sell:
                     trend_ok = is_trending_up(close, bar1, 20, 0.05)
                     log(f"   🔴 Classic SELL check: bar1={bar1}, trend={'✅' if trend_ok else '❌'}")
@@ -694,34 +730,46 @@ def detect_signal(df, state, symbol, debug=False):
 # =====================================================================================
 # پیگیری سیگنال‌های باز
 # =====================================================================================
-def check_proximity(symbol, current_price, entry, stop, target):
+def check_proximity(symbol, current_price, entry, stop, target, state):
     if entry is None or stop is None or target is None:
         return
     
     stop_distance = abs(current_price - stop) / entry * 100
     target_distance = abs(current_price - target) / entry * 100
     
-    if target_distance < 5 and target_distance > 0:
-        send_telegram_message(
-            f"🎯 نزدیک شدن به حد سود\n\n"
-            f"🔹 نماد: {symbol}\n"
-            f"💰 قیمت فعلی: {current_price:.4f}\n"
-            f"🎯 حد سود: {target:.4f}\n"
-            f"📊 فاصله: {target_distance:.2f}%\n\n"
-            f"⏳ در آستانه بسته شدن\n"
-            f"🕒 {format_iran_time()}"
-        )
+    thresholds = [5.0, 3.0, 1.0, 0.5]
     
-    elif stop_distance < 5 and stop_distance > 0:
-        send_telegram_message(
-            f"⚠️ نزدیک شدن به حد ضرر\n\n"
-            f"🔹 نماد: {symbol}\n"
-            f"💰 قیمت فعلی: {current_price:.4f}\n"
-            f"🛑 حد ضرر: {stop:.4f}\n"
-            f"📊 فاصله: {stop_distance:.2f}%\n\n"
-            f"⚠️ نیاز به پایش دقیق\n"
-            f"🕒 {format_iran_time()}"
-        )
+    if target_distance > 0:
+        for t in thresholds:
+            if target_distance <= t:
+                if not hasattr(state, '_last_target_alert') or state._last_target_alert is None or target_distance < t:
+                    send_telegram_message(
+                        f"🎯 نزدیک شدن به حد سود\n\n"
+                        f"🔹 نماد: {symbol}\n"
+                        f"💰 قیمت فعلی: {current_price:.4f}\n"
+                        f"🎯 حد سود: {target:.4f}\n"
+                        f"📊 فاصله: {target_distance:.2f}%\n\n"
+                        f"⏳ در آستانه بسته شدن\n"
+                        f"🕒 {format_iran_time()}"
+                    )
+                    state._last_target_alert = t
+                break
+    
+    if stop_distance > 0:
+        for t in thresholds:
+            if stop_distance <= t:
+                if not hasattr(state, '_last_stop_alert') or state._last_stop_alert is None or stop_distance < t:
+                    send_telegram_message(
+                        f"⚠️ نزدیک شدن به حد ضرر\n\n"
+                        f"🔹 نماد: {symbol}\n"
+                        f"💰 قیمت فعلی: {current_price:.4f}\n"
+                        f"🛑 حد ضرر: {stop:.4f}\n"
+                        f"📊 فاصله: {stop_distance:.2f}%\n\n"
+                        f"⚠️ نیاز به پایش دقیق\n"
+                        f"🕒 {format_iran_time()}"
+                    )
+                    state._last_stop_alert = t
+                break
 
 def track_open_signals():
     history = load_history()
@@ -732,14 +780,21 @@ def track_open_signals():
             if df is None or df.empty:
                 continue
             cp = df['close'].iloc[-1]
-            entry, stop, target = trade['entry_price'], trade['stop_loss'], trade['take_profit']
+            entry = trade['entry_price']
+            stop = trade['stop_loss']
+            target = trade['take_profit']
             
-            check_proximity(trade['symbol'], cp, entry, stop, target)
+            key = f"{trade['symbol']}_{trade['signal_time']}"
+            if key not in _proximity_states:
+                _proximity_states[key] = ProximityState()
+            
+            check_proximity(trade['symbol'], cp, entry, stop, target, _proximity_states[key])
             
             if trade['direction'] == 'BUY':
-                if cp >= target:
+                if cp >= target and not _proximity_states[key]._target_hit_notified:
                     update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
                     profit_pct = (cp-entry)/entry*100
+                    _proximity_states[key]._target_hit_notified = True
                     send_telegram_message(
                         f"🎯 حد سود فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -749,9 +804,10 @@ def track_open_signals():
                         f"📈 میزان سود: +{profit_pct:.2f}%\n"
                         f"🕒 {format_iran_time()}"
                     )
-                elif cp <= stop:
+                elif cp <= stop and not _proximity_states[key]._stop_hit_notified:
                     update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
                     loss_pct = (cp-entry)/entry*100
+                    _proximity_states[key]._stop_hit_notified = True
                     send_telegram_message(
                         f"💔 حد ضرر فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -762,9 +818,10 @@ def track_open_signals():
                         f"🕒 {format_iran_time()}"
                     )
             else:
-                if cp <= target:
+                if cp <= target and not _proximity_states[key]._target_hit_notified:
                     update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
                     profit_pct = (entry-cp)/entry*100
+                    _proximity_states[key]._target_hit_notified = True
                     send_telegram_message(
                         f"🎯 حد سود فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -774,9 +831,10 @@ def track_open_signals():
                         f"📈 میزان سود: +{profit_pct:.2f}%\n"
                         f"🕒 {format_iran_time()}"
                     )
-                elif cp >= stop:
+                elif cp >= stop and not _proximity_states[key]._stop_hit_notified:
                     update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
                     loss_pct = (entry-cp)/entry*100
+                    _proximity_states[key]._stop_hit_notified = True
                     send_telegram_message(
                         f"💔 حد ضرر فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -821,6 +879,11 @@ def analyze_and_send():
                 )
 
             if signal and stop and target:
+                # رند کردن قیمت‌ها
+                entry = round_price(entry, symbol)
+                stop = round_price(stop, symbol)
+                target = round_price(target, symbol)
+                
                 profit_pct = (target-entry)/entry*100 if signal=="BUY" else (entry-target)/entry*100
                 loss_pct = (entry-stop)/entry*100 if signal=="BUY" else (stop-entry)/entry*100
                 rr = abs(profit_pct/loss_pct) if loss_pct != 0 else 0
@@ -838,9 +901,9 @@ def analyze_and_send():
                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📊 امتیاز: {score}/5\n"
                     f"🔸 نوع: {direction_emoji} {direction_text}\n\n"
-                    f"📍 نقطه ورود: {entry:.4f}\n"
-                    f"🛑 حد ضرر: {stop:.4f}\n"
-                    f"🎯 حد سود: {target:.4f}\n\n"
+                    f"📍 نقطه ورود: {entry:.{PRICE_PRECISION.get(symbol, 2)}f}\n"
+                    f"🛑 حد ضرر: {stop:.{PRICE_PRECISION.get(symbol, 2)}f}\n"
+                    f"🎯 حد سود: {target:.{PRICE_PRECISION.get(symbol, 2)}f}\n\n"
                     f"📈 سود مورد انتظار: +{profit_pct:.2f}%\n"
                     f"📉 ضرر قابل قبول: -{loss_pct:.2f}%\n"
                     f"⚖️ نسبت Risk/Reward: {rr:.2f}\n\n"
@@ -909,7 +972,8 @@ if __name__ == "__main__":
         "• Memory: 100 Pivot\n"
         "• Scoring: 3-Level (🟢🟡⚪)\n"
         "• Trend Filter: Classic only\n"
-        "• Symbols: LTCUSDT, DOGEUSDT, ETHUSDT\n\n"
+        "• Symbols: LTC, DOGE, ETH, BNB, SOL, PAXG\n"
+        "• Price Precision: 2-10 decimals\n\n"
         f"🕒 {format_iran_time()}"
     )
     
