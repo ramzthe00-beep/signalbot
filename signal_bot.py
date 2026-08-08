@@ -4,9 +4,9 @@ Signal Bot Pro - TheTrueTrade (نسخه Multi-Timeframe)
 ====================================================================
 ربات سیگنال‌دهی پیشرفته - فقط ارسال سیگنال (بدون ترید خودکار)
 نسخه نهایی کامل با ۷ تایم‌فریم و ۱۱ ارز
-+ هشتگ‌گذاری هوشمند
-+ گزارش به تفکیک تایم‌فریم
 + منطق دقیقاً مطابق Pine Script
++ رفع مشکل تایم‌فریم‌های بالاتر با countback مناسب
++ حذف هشدار نزدیکی به تارگت و استاپ
 """
 
 import os
@@ -40,24 +40,6 @@ BASE_URL = "https://apiv2.thetruetrade.io"
 HISTORY_FILE = "trades_history.json"
 
 # =====================================================================================
-# هشتگ‌ها
-# =====================================================================================
-HASHTAGS = {
-    "startup": "#DTM_Startup",
-    "diagnostic": "#DTM_Diagnostic",
-    "signal": "#DTM_Signal",
-    "log": "#DTM_Log",
-    "alert": "#DTM_Alert",
-    "pivot": "#DTM_Pivot",
-    "target": "#DTM_Target",
-    "stop": "#DTM_Stop",
-    "daily": "#DTM_DailyReport",
-    "monthly": "#DTM_MonthlyReport",
-    "proximity_target": "#DTM_NearTarget",
-    "proximity_stop": "#DTM_NearStop",
-}
-
-# =====================================================================================
 # ثابت‌های استراتژی
 # =====================================================================================
 TREND_LOOKBACK = 20
@@ -76,10 +58,38 @@ BIG_CANDLE_AVG_LEN = 14
 BIG_CANDLE_MULTIPLIER = 1.5
 
 # =====================================================================================
-# تایم‌فریم‌ها و ارزها
+# تایم‌فریم‌ها و تنظیمات API
 # =====================================================================================
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "2h", "4h"]
 
+# طبق کتابچه API: resolution باید "1", "5", "15", "30", "60", "120", "240" باشد
+RESOLUTION_MAP = {
+    "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240",
+}
+
+# مدت زمان هر کندل به دقیقه
+TF_MINUTES = {
+    "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240,
+}
+
+# countback مناسب برای هر تایم‌فریم
+# طبق کتابچه API: محدودیتی برای countback ذکر نشده، اما برای تایم‌فریم‌های بالاتر
+# باید limit رو کمتر کنیم تا from_timestamp از محدوده داده‌های موجود خارج نشه
+TF_LIMITS = {
+    "1m": 500,
+    "5m": 500,
+    "15m": 500,
+    "30m": 500,
+    "1h": 300,
+    "2h": 200,
+    "4h": 100,
+}
+
+# =====================================================================================
+# ارزها
+# =====================================================================================
 SYMBOLS = [
     "LTCUSDT", "DOGEUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "PAXGUSDT",
     "XRPUSDT", "BTCUSDT", "LINKUSDT", "UNIUSDT", "XLMUSDT"
@@ -110,25 +120,32 @@ class TrueTradeData:
         self.base_url = BASE_URL
 
     def fetch_ohlcv(self, symbol, timeframe='1m', limit=500):
+        """
+        دریافت داده‌های OHLCV از API صرافی.
+        طبق کتابچه API:
+        - resolution: عددی مانند "1", "60", "240"
+        - from, to: Unix timestamp به ثانیه
+        - countback: تعداد کندل‌های درخواستی
+        """
         symbol_clean = symbol.upper()
-        resolution_map = {
-            "1m": "1", "5m": "5", "15m": "15", "30m": "30",
-            "1h": "60", "2h": "120", "4h": "240",
-            "1d": "D", "1w": "W", "1M": "M"
-        }
-        resolution = resolution_map.get(timeframe, "1")
 
-        # محاسبه from_timestamp بر اساس تایم‌فریم
-        tf_minutes = {
-            "1m": 1, "5m": 5, "15m": 15, "30m": 30,
-            "1h": 60, "2h": 120, "4h": 240
-        }
-        minutes = tf_minutes.get(timeframe, 1)
+        # طبق کتابچه API: resolution باید عددی باشد
+        resolution = RESOLUTION_MAP.get(timeframe, "1")
 
+        # طبق کتابچه API: from و to باید Unix timestamp به ثانیه باشند
+        minutes = TF_MINUTES.get(timeframe, 1)
         to_timestamp = int(time.time())
         from_timestamp = to_timestamp - (limit * minutes * 60)
 
-        uri = f"/futures/udf/history?symbol={symbol_clean}&resolution={resolution}&from={from_timestamp}&to={to_timestamp}&countback={limit}"
+        # طبق کتابچه API: پارامترها → symbol, resolution, from, to, countback
+        uri = (
+            f"/futures/udf/history"
+            f"?symbol={symbol_clean}"
+            f"&resolution={resolution}"
+            f"&from={from_timestamp}"
+            f"&to={to_timestamp}"
+            f"&countback={limit}"
+        )
 
         try:
             response = requests.get(f"{self.base_url}{uri}", timeout=15)
@@ -136,6 +153,7 @@ class TrueTradeData:
             data = response.json()
 
             if not data or data.get('s') != 'ok':
+                logger.warning(f"[API] {symbol} {timeframe}: s != ok, response: {str(data)[:200]}")
                 return None
 
             df = pd.DataFrame({
@@ -147,7 +165,11 @@ class TrueTradeData:
                 'volume': pd.to_numeric(data['v'])
             })
             df.set_index('timestamp', inplace=True)
+
+            logger.info(f"[DATA] {symbol} {timeframe}: {len(df)} candles (limit={limit})")
+
             return df
+
         except Exception as e:
             logger.error(f"[FETCH ERROR] {symbol} {timeframe}: {e}")
             return None
@@ -565,7 +587,7 @@ def send_daily_report():
     win_rate = (wins / closed * 100) if closed > 0 else 0
 
     # گزارش کلی
-    message = f"""📊 گزارش روزانه — {today_str} {HASHTAGS['daily']}
+    message = f"""📊 گزارش روزانه — {today_str}
 ━━━━━━━━━━━━━━━━━━━━━━
 
 📈 کل سیگنال‌ها: {total} عدد
@@ -602,7 +624,7 @@ def send_monthly_report():
     losses = len([t for t in month_trades if t.get('result') == 'STOP_LOSS'])
     win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
 
-    message = f"""📈 گزارش ۳۰ روز گذشته {HASHTAGS['monthly']}
+    message = f"""📈 گزارش ۳۰ روز گذشته
 ━━━━━━━━━━━━━━━━━━━━━━
 
 📊 کل سیگنال‌ها: {total} عدد
@@ -633,7 +655,7 @@ def run_startup_diagnostic():
     logger.info("Running Startup Diagnostic...")
 
     diagnostic_log = []
-    diagnostic_log.append(f"🔍 بررسی سلامت سیستم {HASHTAGS['diagnostic']}")
+    diagnostic_log.append("🔍 بررسی سلامت سیستم")
     diagnostic_log.append("━━━━━━━━━━━━━━━━━━━━━━")
 
     try:
@@ -858,17 +880,11 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
     if not buy_signal and not sell_signal:
         log(f"   ⚪ No signal")
 
-    # لاگ تلگرام (هر ۱۵ دقیقه برای تایم‌فریم‌های زیر ۱ ساعته، هر ۱ ساعت برای بقیه)
+    # لاگ تلگرام - مثل پروژه ۱: ۵ بار اول هر ۵ دقیقه
     current_time = time.time()
     should_send = False
-    
-    if timeframe in ["1m", "5m", "15m", "30m"]:
-        log_interval = 900  # ۱۵ دقیقه
-    else:
-        log_interval = 3600  # ۱ ساعت
-
-    if state.telegram_log_count < 10:
-        if state.last_telegram_log_time == 0 or (current_time - state.last_telegram_log_time) >= log_interval:
+    if state.telegram_log_count < 5:
+        if state.last_telegram_log_time == 0 or (current_time - state.last_telegram_log_time) >= 300:
             should_send = True
     else:
         if current_time - state.last_telegram_log_time >= 21600:
@@ -881,7 +897,7 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
             telegram_debug = "\n".join(debug_log)
             prefix = "🟢" if len(new_pivots_high)+len(new_pivots_low) > 0 else "ℹ️"
             send_telegram_message(
-                f"{prefix} لاگ #{state.telegram_log_count} — {symbol} {timeframe} {HASHTAGS['log']}\n"
+                f"{prefix} لاگ #{state.telegram_log_count} — {symbol} {timeframe}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"```\n{telegram_debug[:3000]}\n```\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -897,52 +913,13 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
     return None, None, None, None, early_signal, None, None, None, []
 
 # =====================================================================================
-# پیگیری سیگنال‌های باز
+# تابع اصلی
 # =====================================================================================
-_proximity_states = {}
-
-def check_proximity(symbol, current_price, entry, stop, target, direction, state):
-    if entry is None or stop is None or target is None:
-        return
-
-    risk_dist = abs(entry - stop)
-    reward_dist = abs(target - entry)
-
-    if direction == 'BUY':
-        stop_progress = (entry - current_price) / risk_dist if risk_dist > 0 else 0
-        target_progress = (current_price - entry) / reward_dist if reward_dist > 0 else 0
-    else:
-        stop_progress = (current_price - entry) / risk_dist if risk_dist > 0 else 0
-        target_progress = (entry - current_price) / reward_dist if reward_dist > 0 else 0
-
-    if stop_progress >= 0.75 and not state.get('_stop_alert_sent', False):
-        state['_stop_alert_sent'] = True
-        send_telegram_message(
-            f"⚠️ هشدار نزدیکی به حد ضرر (75%) {HASHTAGS['proximity_stop']}\n\n"
-            f"🔹 نماد: {symbol}\n"
-            f"💰 قیمت فعلی: {current_price:.4f}\n"
-            f"🛑 حد ضرر: {stop:.4f}\n"
-            f"📊 مسافت طی شده: {stop_progress*100:.1f}% به سمت استاپ\n\n"
-            f"⚠️ فقط ۲۵٪ تا فعال شدن حد ضرر باقی مانده\n"
-            f"🕒 {format_iran_time()}"
-        )
-
-    if target_progress >= 0.60 and not state.get('_target_alert_sent', False):
-        state['_target_alert_sent'] = True
-        unrealized_r = target_progress / (1 - target_progress) if target_progress < 1 else 999
-        send_telegram_message(
-            f"🎯 هشدار نزدیکی به حد سود (R:R = 1.5) {HASHTAGS['proximity_target']}\n\n"
-            f"🔹 نماد: {symbol}\n"
-            f"💰 قیمت فعلی: {current_price:.4f}\n"
-            f"🎯 حد سود: {target:.4f}\n"
-            f"📊 پیشرفت: {target_progress*100:.1f}% به سمت تارگت\n"
-            f"⚖️ R:R فعلی: {unrealized_r:.1f}\n\n"
-            f"🕒 {format_iran_time()}"
-        )
-
-def track_open_signals():
-    history = load_history()
+def analyze_and_send():
     data = TrueTradeData()
+    
+    # پیگیری سیگنال‌های باز (فقط تارگت و استاپ، بدون هشدار نزدیکی)
+    history = load_history()
     for trade in history:
         if trade.get('result') is None:
             df = data.fetch_ohlcv(trade['symbol'], '1m', 10)
@@ -953,21 +930,15 @@ def track_open_signals():
             stop = trade['stop_loss']
             target = trade['take_profit']
             direction = trade['direction']
-
-            key = f"{trade['symbol']}_{trade['signal_time']}"
-            if key not in _proximity_states:
-                _proximity_states[key] = {}
-            state = _proximity_states[key]
-
-            check_proximity(trade['symbol'], cp, entry, stop, target, direction, state)
-
+            
             if direction == 'BUY':
                 if cp >= target:
                     profit_pct = (cp-entry)/entry*100
                     update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
                     send_telegram_message(
-                        f"🎯 حد سود فعال شد {HASHTAGS['target']}\n\n"
+                        f"🎯 حد سود فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
+                        f"⏱️ تایم‌فریم: {trade.get('timeframe', 'N/A')}\n"
                         f"🔸 جهت: LONG (خرید)\n\n"
                         f"📍 ورود: {entry:.4f}\n"
                         f"🎯 خروج: {cp:.4f}\n\n"
@@ -978,8 +949,9 @@ def track_open_signals():
                     loss_pct = (cp-entry)/entry*100
                     update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
                     send_telegram_message(
-                        f"💔 حد ضرر فعال شد {HASHTAGS['stop']}\n\n"
+                        f"💔 حد ضرر فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
+                        f"⏱️ تایم‌فریم: {trade.get('timeframe', 'N/A')}\n"
                         f"🔸 جهت: LONG (خرید)\n\n"
                         f"📍 ورود: {entry:.4f}\n"
                         f"💔 خروج: {cp:.4f}\n\n"
@@ -991,8 +963,9 @@ def track_open_signals():
                     profit_pct = (entry-cp)/entry*100
                     update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
                     send_telegram_message(
-                        f"🎯 حد سود فعال شد {HASHTAGS['target']}\n\n"
+                        f"🎯 حد سود فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
+                        f"⏱️ تایم‌فریم: {trade.get('timeframe', 'N/A')}\n"
                         f"🔸 جهت: SHORT (فروش)\n\n"
                         f"📍 ورود: {entry:.4f}\n"
                         f"🎯 خروج: {cp:.4f}\n\n"
@@ -1003,8 +976,9 @@ def track_open_signals():
                     loss_pct = (entry-cp)/entry*100
                     update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
                     send_telegram_message(
-                        f"💔 حد ضرر فعال شد {HASHTAGS['stop']}\n\n"
+                        f"💔 حد ضرر فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
+                        f"⏱️ تایم‌فریم: {trade.get('timeframe', 'N/A')}\n"
                         f"🔸 جهت: SHORT (فروش)\n\n"
                         f"📍 ورود: {entry:.4f}\n"
                         f"💔 خروج: {cp:.4f}\n\n"
@@ -1012,17 +986,12 @@ def track_open_signals():
                         f"🕒 {format_iran_time()}"
                     )
 
-# =====================================================================================
-# تابع اصلی
-# =====================================================================================
-def analyze_and_send():
-    data = TrueTradeData()
-    track_open_signals()
-
     for symbol in SYMBOLS:
         for timeframe in TIMEFRAMES:
             try:
-                df = data.fetch_ohlcv(symbol, timeframe, 500)
+                # استفاده از limit مناسب برای هر تایم‌فریم
+                limit = TF_LIMITS.get(timeframe, 500)
+                df = data.fetch_ohlcv(symbol, timeframe, limit)
                 if df is None or df.empty:
                     continue
 
@@ -1037,7 +1006,7 @@ def analyze_and_send():
                 if early and not state.alert_sent:
                     state.alert_sent = True
                     send_telegram_message(
-                        f"⚡ در حال تشکیل Pivot جدید {HASHTAGS['pivot']}\n\n"
+                        f"⚡ در حال تشکیل Pivot جدید\n\n"
                         f"🔹 نماد: {symbol}\n"
                         f"⏱️ تایم‌فریم: {timeframe}\n"
                         f"💰 قیمت: {cp:.4f}\n"
@@ -1062,7 +1031,7 @@ def analyze_and_send():
                         details_text = "\n".join([f"{i+1}. {d}" for i, d in enumerate(details)])
 
                     send_telegram_message(
-                        f"{emoji} سیگنال {label} — {symbol} {timeframe} {HASHTAGS['signal']}\n"
+                        f"{emoji} سیگنال {label} — {symbol} {timeframe}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                         f"📊 امتیاز: {score}/5\n"
                         f"⏱️ تایم‌فریم: {timeframe}\n"
@@ -1127,9 +1096,8 @@ def health():
 if __name__ == "__main__":
     logger.info("Signal Bot Pro MTF Starting...")
 
-    hashtag_list = "\n".join([f"• {v} → {k}" for k, v in HASHTAGS.items()])
     send_telegram_message(
-        f"🤖 SignalBot Pro MTF — آنلاین {HASHTAGS['startup']}\n\n"
+        f"🤖 SignalBot Pro MTF — آنلاین\n\n"
         f"🧠 استراتژی: DTM Divergence (Pine Script Mirror)\n"
         f"📊 سیگنال‌دهی: خودکار (فقط سیگنال)\n"
         f"❌ ترید خودکار: غیرفعال\n\n"
@@ -1137,8 +1105,8 @@ if __name__ == "__main__":
         f"• Timeframes: {', '.join(TIMEFRAMES)}\n"
         f"• Symbols: {len(SYMBOLS)} عدد\n"
         f"• Total Pairs: {len(SYMBOLS) * len(TIMEFRAMES)}\n"
-        f"• Pivot: 5/3 | Scoring: 5-Level\n\n"
-        f"📌 هشتگ‌ها:\n{hashtag_list}\n\n"
+        f"• Pivot: 5/3 | Scoring: 5-Level\n"
+        f"• Countback: 1m/5m/15m/30m=500, 1h=300, 2h=200, 4h=100\n\n"
         f"🕒 {format_iran_time()}"
     )
 
