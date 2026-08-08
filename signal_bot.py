@@ -3,10 +3,8 @@
 Signal Bot Pro - TheTrueTrade
 ====================================================================
 ربات سیگنال‌دهی پیشرفته - فقط ارسال سیگنال (بدون ترید خودکار)
-نسخه اصلاح شده نهایی - با لاگ کامل تلگرام و پیام‌های اختصاصی
-+ محدودیت پیام نزدیکی (آستانه‌های 5%، 3%، 1%، 0.5%)
-+ رند کردن قیمت‌ها با ۱۰ رقم اعشار
-+ اضافه شدن BNBUSDT, SOLUSDT, PAXGUSDT
+نسخه اصلاح شده نهایی - منطق دقیقاً مطابق Pine Script
++ هشدار نزدیکی: تارگت در R:R=1.5 | استاپ در 75%
 """
 
 import os
@@ -44,24 +42,34 @@ BASE_URL = "https://apiv2.thetruetrade.io"
 HISTORY_FILE = "trades_history.json"
 
 # =====================================================================================
-# تنظیمات Tick Size و Precision برای هر نماد
+# ثابت‌های استراتژی — دقیقاً مطابق Pine Script
+# =====================================================================================
+TREND_LOOKBACK = 20
+TREND_SLOPE_MIN_PCT = 0.05
+FIB_USE_618 = True
+FIB_USE_786 = True
+FIB_TOLERANCE_PCT = 0.5
+FIB_SEARCH_BARS = 100
+STOP_BUFFER_PCT = 0.05
+
+# ثابت‌های کندل تأییدیه
+SHADOW_TO_BODY_RATIO = 2.0
+MAX_OPPOSITE_SHADOW_PCT = 20.0
+MIN_CANDLE_ATR_RATIO = 0.3
+BIG_CANDLE_AVG_LEN = 14
+BIG_CANDLE_MULTIPLIER = 1.5
+
+# =====================================================================================
+# Tick Size و Precision
 # =====================================================================================
 TICK_SIZES = {
-    "LTCUSDT": 0.01,
-    "DOGEUSDT": 0.00001,
-    "ETHUSDT": 0.01,
-    "BNBUSDT": 0.01,
-    "SOLUSDT": 0.001,
-    "PAXGUSDT": 0.01,
+    "LTCUSDT": 0.01, "DOGEUSDT": 0.00001, "ETHUSDT": 0.01,
+    "BNBUSDT": 0.01, "SOLUSDT": 0.001, "PAXGUSDT": 0.01,
 }
 
 PRICE_PRECISION = {
-    "LTCUSDT": 2,
-    "DOGEUSDT": 5,
-    "ETHUSDT": 2,
-    "BNBUSDT": 2,
-    "SOLUSDT": 3,
-    "PAXGUSDT": 2,
+    "LTCUSDT": 2, "DOGEUSDT": 5, "ETHUSDT": 2,
+    "BNBUSDT": 2, "SOLUSDT": 3, "PAXGUSDT": 2,
 }
 
 # =====================================================================================
@@ -127,19 +135,7 @@ def format_iran_date(dt=None):
     return dt.strftime('%Y-%m-%d')
 
 # =====================================================================================
-# کلاس وضعیت هشدار نزدیکی
-# =====================================================================================
-class ProximityState:
-    def __init__(self):
-        self._last_target_alert = None
-        self._last_stop_alert = None
-        self._target_hit_notified = False
-        self._stop_hit_notified = False
-
-_proximity_states = {}
-
-# =====================================================================================
-# توابع محاسباتی
+# توابع محاسباتی پایه
 # =====================================================================================
 def calc_rsi(close, length=14):
     delta = close.diff()
@@ -181,73 +177,175 @@ def find_pivot_low(low, left=5, right=3):
             result.iloc[i] = low.iloc[i]
     return result
 
-def is_trending_up(close, ref_bar, lookback=20, slope_min_pct=0.05):
+# =====================================================================================
+# روند — slope × lookback (معادل ta.linreg در پاین)
+# =====================================================================================
+def is_trending_up(close, ref_bar, lookback=TREND_LOOKBACK, slope_min_pct=TREND_SLOPE_MIN_PCT):
     if ref_bar is None or ref_bar - lookback < 0:
         return False
     y = close.iloc[ref_bar - lookback:ref_bar + 1].values
     if len(y) < 2:
         return False
-    slope = np.polyfit(np.arange(len(y)), y, 1)[0]
+    slope_per_bar = np.polyfit(np.arange(len(y)), y, 1)[0]
+    total_slope = slope_per_bar * lookback
     avg = y.mean()
-    return (slope / avg) * 100 > slope_min_pct if avg != 0 else False
+    if avg == 0:
+        return False
+    return (total_slope / avg) * 100 > slope_min_pct
 
-def is_trending_down(close, ref_bar, lookback=20, slope_min_pct=0.05):
+def is_trending_down(close, ref_bar, lookback=TREND_LOOKBACK, slope_min_pct=TREND_SLOPE_MIN_PCT):
     if ref_bar is None or ref_bar - lookback < 0:
         return False
     y = close.iloc[ref_bar - lookback:ref_bar + 1].values
     if len(y) < 2:
         return False
-    slope = np.polyfit(np.arange(len(y)), y, 1)[0]
+    slope_per_bar = np.polyfit(np.arange(len(y)), y, 1)[0]
+    total_slope = slope_per_bar * lookback
     avg = y.mean()
-    return (slope / avg) * 100 < -slope_min_pct if avg != 0 else False
+    if avg == 0:
+        return False
+    return (total_slope / avg) * 100 < -slope_min_pct
 
 def resolve_bar_from_ts(df_indexed, ts):
     if ts not in df_indexed.index:
         return None
     return df_indexed.index.get_loc(ts)
 
-def round_price(price, symbol):
-    """رند کردن قیمت با ۱۰ رقم اعشار و tick size"""
-    precision = PRICE_PRECISION.get(symbol.upper(), 2)
-    tick = TICK_SIZES.get(symbol.upper(), 0.01)
-    rounded = round(price / tick) * tick
-    return round(rounded, precision)
+# =====================================================================================
+# تغییر رنگ MACD Histogram بین دو پیوت
+# =====================================================================================
+def check_macd_color_change(hist_series, bar1, bar2, need_negative_phase):
+    if bar1 is None or bar2 is None or bar2 <= bar1 + 1:
+        return False
+    window = hist_series.iloc[bar1 + 1:bar2]
+    if window.empty:
+        return False
+    return (window < 0).any() if need_negative_phase else (window > 0).any()
 
-def compute_stop_and_targets(pivot_highs, pivot_lows, direction, df_indexed, atr_val, stop_buffer_pct=0.05):
+# =====================================================================================
+# فیبوناچی
+# =====================================================================================
+def find_trend_start_low(low_series, ref_bar, search_bars=FIB_SEARCH_BARS):
+    if ref_bar is None:
+        return None
+    start = max(0, ref_bar - search_bars + 1)
+    window = low_series.iloc[start:ref_bar + 1]
+    return window.min() if len(window) > 0 else None
+
+def find_trend_start_high(high_series, ref_bar, search_bars=FIB_SEARCH_BARS):
+    if ref_bar is None:
+        return None
+    start = max(0, ref_bar - search_bars + 1)
+    window = high_series.iloc[start:ref_bar + 1]
+    return window.max() if len(window) > 0 else None
+
+def check_fib_level(fib_start, fib_end, target_price, is_retrace_down,
+                     use_618=FIB_USE_618, use_786=FIB_USE_786, tolerance_pct=FIB_TOLERANCE_PCT):
+    if fib_start is None or fib_end is None or fib_end == fib_start:
+        return False
+    range_ = fib_end - fib_start
+    tol = abs(range_) * (tolerance_pct / 100.0)
+    if is_retrace_down:
+        level618 = fib_end - range_ * 0.618
+        level786 = fib_end - range_ * 0.786
+    else:
+        level618 = fib_end + abs(range_) * 0.618
+        level786 = fib_end + abs(range_) * 0.786
+    ok = False
+    if use_618 and abs(target_price - level618) <= tol:
+        ok = True
+    if use_786 and abs(target_price - level786) <= tol:
+        ok = True
+    return ok
+
+# =====================================================================================
+# کندل تأییدیه — مطابق Pine Script
+# =====================================================================================
+def check_price_action(df, bar2, direction, atr_val):
+    if bar2 is None or bar2 < 0 or bar2 >= len(df):
+        return False, []
+
+    last = df.iloc[bar2]
+    candle_range = last['high'] - last['low']
+    candle_body = abs(last['close'] - last['open'])
+    upper_shadow = last['high'] - max(last['close'], last['open'])
+    lower_shadow = min(last['close'], last['open']) - last['low']
+
+    size_ok = candle_range >= MIN_CANDLE_ATR_RATIO * atr_val
+
+    start_idx = max(0, bar2 - BIG_CANDLE_AVG_LEN + 1)
+    avg_body = df['close'].iloc[start_idx:bar2 + 1].diff().abs().mean()
+    if pd.isna(avg_body) or avg_body == 0:
+        avg_body = candle_body
+
+    pa = False
+    pa_reasons = []
+
+    if direction == "BUY":
+        bullish_wick = (candle_range > 0 and
+                        lower_shadow >= SHADOW_TO_BODY_RATIO * candle_body and
+                        (upper_shadow / candle_range) * 100 <= MAX_OPPOSITE_SHADOW_PCT and
+                        size_ok)
+        big_green = (last['close'] > last['open'] and
+                     candle_body >= BIG_CANDLE_MULTIPLIER * avg_body and
+                     size_ok)
+
+        if bullish_wick:
+            pa = True; pa_reasons.append("Bullish Wick")
+        if big_green:
+            pa = True; pa_reasons.append("Big Green Candle")
+    else:
+        bearish_wick = (candle_range > 0 and
+                        upper_shadow >= SHADOW_TO_BODY_RATIO * candle_body and
+                        (lower_shadow / candle_range) * 100 <= MAX_OPPOSITE_SHADOW_PCT and
+                        size_ok)
+        bearish_hanging = (candle_range > 0 and
+                           lower_shadow >= SHADOW_TO_BODY_RATIO * candle_body and
+                           (upper_shadow / candle_range) * 100 <= MAX_OPPOSITE_SHADOW_PCT and
+                           size_ok)
+        big_red = (last['close'] < last['open'] and
+                   candle_body >= BIG_CANDLE_MULTIPLIER * avg_body and
+                   size_ok)
+
+        if bearish_wick:
+            pa = True; pa_reasons.append("Bearish Wick")
+        if bearish_hanging:
+            pa = True; pa_reasons.append("Bearish Hanging Man")
+        if big_red:
+            pa = True; pa_reasons.append("Big Red Candle")
+
+    return pa, pa_reasons
+
+# =====================================================================================
+# استاپ و تارگت
+# =====================================================================================
+def compute_stop_and_targets(pivot_highs, pivot_lows, direction, df_indexed, atr_val, stop_buffer_pct=STOP_BUFFER_PCT):
     if direction == "long":
         if len(pivot_lows) < 2:
             return None, None, None
         pl_1, pl_2 = pivot_lows[-2], pivot_lows[-1]
-
         bar1 = resolve_bar_from_ts(df_indexed, pl_1['ts'])
         bar2 = resolve_bar_from_ts(df_indexed, pl_2['ts'])
-
         if bar1 is None or bar2 is None or bar2 <= bar1:
             return None, None, None
-
         stop_price = min(pl_1['price'], pl_2['price']) - stop_buffer_pct * atr_val
         mid_peak = df_indexed["high"].iloc[bar1+1:bar2].max() if bar2 > bar1+1 else df_indexed["high"].iloc[bar1:bar2+1].max()
         if pd.isna(mid_peak):
             return None, None, None
         return stop_price, mid_peak, None
-
     elif direction == "short":
         if len(pivot_highs) < 2:
             return None, None, None
         ph_1, ph_2 = pivot_highs[-2], pivot_highs[-1]
-
         bar1 = resolve_bar_from_ts(df_indexed, ph_1['ts'])
         bar2 = resolve_bar_from_ts(df_indexed, ph_2['ts'])
-
         if bar1 is None or bar2 is None or bar2 <= bar1:
             return None, None, None
-
         stop_price = max(ph_1['price'], ph_2['price']) + stop_buffer_pct * atr_val
         mid_trough = df_indexed["low"].iloc[bar1+1:bar2].min() if bar2 > bar1+1 else df_indexed["low"].iloc[bar1:bar2+1].min()
         if pd.isna(mid_trough):
             return None, None, None
         return stop_price, mid_trough, None
-
     return None, None, None
 
 def resolve_final_target(entry, stop, tp_raw, direction, min_rr=2.0):
@@ -259,115 +357,105 @@ def resolve_final_target(entry, stop, tp_raw, direction, min_rr=2.0):
         return tp_raw
     return entry + risk * min_rr if direction == "long" else entry - risk * min_rr
 
+def round_price(price, symbol):
+    precision = PRICE_PRECISION.get(symbol.upper(), 2)
+    tick = TICK_SIZES.get(symbol.upper(), 0.01)
+    rounded = round(price / tick) * tick
+    return round(rounded, precision)
+
 # =====================================================================================
-# سیستم امتیازدهی
+# سیستم امتیازدهی — مطابق دقیق پاین
 # =====================================================================================
-def calculate_divergence_score(p1, p2, direction, df, current_price):
-    score = 0
+def calculate_divergence_score(p1, p2, direction, bar1, bar2, hist_series, high_series, low_series, df_indexed, atr_val):
     details = []
 
+    # RSI
     if direction == "BUY":
         if p2['price'] < p1['price'] and p2['rsi'] > p1['rsi']:
-            score += 1; details.append("✅ RSI Divergence (Classic)")
+            rsi_ok = True
         elif p2['price'] > p1['price'] and p2['rsi'] < p1['rsi']:
-            score += 1; details.append("✅ RSI Divergence (Hidden)")
+            rsi_ok = True
         else:
-            details.append("❌ RSI")
+            rsi_ok = False
     else:
         if p2['price'] > p1['price'] and p2['rsi'] < p1['rsi']:
-            score += 1; details.append("✅ RSI Divergence (Classic)")
+            rsi_ok = True
         elif p2['price'] < p1['price'] and p2['rsi'] > p1['rsi']:
-            score += 1; details.append("✅ RSI Divergence (Hidden)")
+            rsi_ok = True
         else:
-            details.append("❌ RSI")
+            rsi_ok = False
+    details.append("✅ RSI Divergence" if rsi_ok else "❌ RSI")
 
+    # MACD Line
     if direction == "BUY":
         if p2['price'] < p1['price'] and p2['macdline'] > p1['macdline']:
-            score += 1; details.append("✅ MACD Line Divergence")
+            macdline_ok = True
         elif p2['price'] > p1['price'] and p2['macdline'] < p1['macdline']:
-            score += 1; details.append("✅ MACD Line Divergence (Hidden)")
+            macdline_ok = True
         else:
-            details.append("❌ MACD Line")
+            macdline_ok = False
     else:
         if p2['price'] > p1['price'] and p2['macdline'] < p1['macdline']:
-            score += 1; details.append("✅ MACD Line Divergence")
+            macdline_ok = True
         elif p2['price'] < p1['price'] and p2['macdline'] > p1['macdline']:
-            score += 1; details.append("✅ MACD Line Divergence (Hidden)")
+            macdline_ok = True
         else:
-            details.append("❌ MACD Line")
+            macdline_ok = False
+    details.append("✅ MACD Line Divergence" if macdline_ok else "❌ MACD Line")
 
-    hist_div = False
+    # MACD Histogram
     if direction == "BUY":
-        if p2['price'] < p1['price'] and p2['hist'] > p1['hist']:
-            hist_div = True
-        elif p2['price'] > p1['price'] and p2['hist'] < p1['hist']:
-            hist_div = True
+        hist_shape_ok = ((p2['price'] < p1['price'] and p2['hist'] > p1['hist']) or
+                         (p2['price'] > p1['price'] and p2['hist'] < p1['hist']))
+        both_same_sign = p1['hist'] < 0 and p2['hist'] < 0
+        color_changed = check_macd_color_change(hist_series, bar1, bar2, need_negative_phase=False)
+        macdhist_ok = hist_shape_ok and both_same_sign and color_changed
     else:
-        if p2['price'] > p1['price'] and p2['hist'] < p1['hist']:
-            hist_div = True
-        elif p2['price'] < p1['price'] and p2['hist'] > p1['hist']:
-            hist_div = True
+        hist_shape_ok = ((p2['price'] > p1['price'] and p2['hist'] < p1['hist']) or
+                         (p2['price'] < p1['price'] and p2['hist'] > p1['hist']))
+        both_same_sign = p1['hist'] > 0 and p2['hist'] > 0
+        color_changed = check_macd_color_change(hist_series, bar1, bar2, need_negative_phase=True)
+        macdhist_ok = hist_shape_ok and both_same_sign and color_changed
+    details.append("✅ MACD Histogram + Color Change" if macdhist_ok else "❌ MACD Histogram")
 
-    color_changed = (p1['hist'] < 0 and p2['hist'] > 0) or (p1['hist'] > 0 and p2['hist'] < 0)
-    if hist_div and color_changed:
-        score += 1; details.append("✅ MACD Histogram + Color Change")
-    elif hist_div:
-        details.append("⚠️ MACD Histogram (No Color Change)")
+    # Gating
+    base3 = rsi_ok and macdline_ok and macdhist_ok
+    if not base3:
+        details.append("❌ حداقل ۳ تأییدیه پایه برقرار نیست")
+        return 0, details
+
+    score = 3
+
+    # Fibonacci
+    if direction == "BUY":
+        trend_start = find_trend_start_high(high_series, bar1)
+        fib_ok = check_fib_level(trend_start, p1['price'], p2['price'], is_retrace_down=False)
     else:
-        details.append("❌ MACD Histogram")
-
-    if len(df) > 20:
-        h20, l20 = df['high'].iloc[-20:].max(), df['low'].iloc[-20:].min()
-        if h20 != l20:
-            f618 = l20 + 0.618*(h20-l20)
-            f786 = l20 + 0.786*(h20-l20)
-            if abs(current_price-f618)/f618 < 0.005 or abs(current_price-f786)/f786 < 0.005:
-                score += 1; details.append("✅ Fibonacci (0.618/0.786)")
-            else:
-                details.append("❌ Fibonacci")
-        else:
-            details.append("❌ Fibonacci")
+        trend_start = find_trend_start_low(low_series, bar1)
+        fib_ok = check_fib_level(trend_start, p1['price'], p2['price'], is_retrace_down=True)
+    if fib_ok:
+        score += 1; details.append("✅ Fibonacci (0.618/0.786)")
     else:
         details.append("❌ Fibonacci")
 
-    if len(df) >= 3:
-        last, prev = df.iloc[-1], df.iloc[-2]
-        avg_range = (df['high']-df['low']).rolling(10).mean().iloc[-1]
-        body = abs(last['close']-last['open'])
-        upper_wick = last['high'] - max(last['open'], last['close'])
-        lower_wick = min(last['open'], last['close']) - last['low']
-
-        pa = False
-        pa_reasons = []
-        if (last['high']-last['low']) > avg_range*2:
-            pa = True; pa_reasons.append("Large Candle")
-        if direction == "BUY" and lower_wick > body*2 and upper_wick < body*0.5:
-            pa = True; pa_reasons.append("Hammer")
-        if direction == "SELL" and upper_wick > body*2 and lower_wick < body*0.5:
-            pa = True; pa_reasons.append("Shooting Star")
-        if direction == "BUY" and last['close']>last['open'] and prev['close']<prev['open'] and last['close']>prev['open'] and last['open']<prev['close']:
-            pa = True; pa_reasons.append("Bullish Engulfing")
-        if direction == "SELL" and last['close']<last['open'] and prev['close']>prev['open'] and last['close']<prev['open'] and last['open']>prev['close']:
-            pa = True; pa_reasons.append("Bearish Engulfing")
-
-        if pa:
-            score += 1; details.append(f"✅ Price Action ({', '.join(pa_reasons)})")
-        else:
-            details.append("❌ Price Action")
+    # Price Action
+    pa_ok, pa_reasons = check_price_action(df_indexed, bar2, direction, atr_val)
+    if pa_ok:
+        score += 1; details.append(f"✅ Price Action ({', '.join(pa_reasons)})")
     else:
         details.append("❌ Price Action")
 
     return score, details
 
-def classify_signal(score, details, direction):
+def classify_signal(score):
     if score >= 5:
-        return "🟢", "Ideal", score, details
+        return "🟢", "Ideal"
     elif score >= 4:
-        return "🟡", "Custom", score, details
+        return "🟡", "Custom"
     elif score >= 3:
-        return "⚪", "Minimal", score, details
+        return "⚪", "Minimal"
     else:
-        return None, None, score, details
+        return None, None
 
 # =====================================================================================
 # کلاس وضعیت
@@ -416,17 +504,14 @@ def send_daily_report():
     history = load_history()
     today_str = format_iran_date()
     today_trades = [t for t in history if t.get('signal_time', '').startswith(today_str)]
-    
     if not today_trades:
         return
-    
     total = len(today_trades)
     wins = len([t for t in today_trades if t.get('result') == 'TAKE_PROFIT'])
     losses = len([t for t in today_trades if t.get('result') == 'STOP_LOSS'])
     open_trades = len([t for t in today_trades if t.get('result') is None])
     closed = wins + losses
     win_rate = (wins / closed * 100) if closed > 0 else 0
-    
     message = f"""📊 گزارش روزانه — {today_str}
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -435,14 +520,12 @@ def send_daily_report():
 ❌ ناموفق: {losses}
 ⏳ باز: {open_trades}
 
-📊 نرخ موفقیت (بسته شده): {win_rate:.1f}%
+📊 نرخ موفقیت: {win_rate:.1f}%
 💪 وضعیت: {'عالی! 🚀' if wins > losses else 'نیاز به بررسی 📊'}"""
-
     for i, trade in enumerate(today_trades[-5:], 1):
         result_emoji = "✅" if trade.get('result') == 'TAKE_PROFIT' else "❌" if trade.get('result') == 'STOP_LOSS' else "⏳"
         direction = "LONG" if trade.get('direction') == 'BUY' else "SHORT"
         message += f"\n{i}. {trade['symbol']} {direction} {result_emoji}"
-    
     message += f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
     send_telegram_message(message)
 
@@ -450,15 +533,12 @@ def send_monthly_report():
     history = load_history()
     month_ago = (datetime.now(timezone(timedelta(hours=3, minutes=30))) - timedelta(days=30)).strftime('%Y-%m-%d')
     month_trades = [t for t in history if t.get('signal_time', '') >= month_ago]
-    
     if not month_trades:
         return
-    
     total = len(month_trades)
     wins = len([t for t in month_trades if t.get('result') == 'TAKE_PROFIT'])
     losses = len([t for t in month_trades if t.get('result') == 'STOP_LOSS'])
     win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-    
     message = f"""📈 گزارش ۳۰ روز گذشته
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -479,18 +559,16 @@ def send_monthly_report():
 # =====================================================================================
 def run_startup_diagnostic():
     logger.info("Running Startup Diagnostic...")
-    
     diagnostic_log = []
     diagnostic_log.append("🔍 بررسی سلامت سیستم")
     diagnostic_log.append("━━━━━━━━━━━━━━━━━━━━━━")
-    
     try:
         requests.get("https://www.google.com", timeout=5)
         diagnostic_log.append("🟢 اتصال اینترنت")
     except:
         diagnostic_log.append("🔴 اتصال اینترنت")
-    
     data = TrueTradeData()
+    df = None
     try:
         df = data.fetch_ohlcv("LTCUSDT", "1m", 500)
         if df is not None and not df.empty:
@@ -499,7 +577,6 @@ def run_startup_diagnostic():
             diagnostic_log.append("🔴 دریافت داده")
     except Exception as e:
         diagnostic_log.append(f"🔴 دریافت داده: {str(e)[:50]}")
-    
     try:
         if df is not None and not df.empty:
             rsi = calc_rsi(df['close'], 14)
@@ -513,15 +590,12 @@ def run_startup_diagnostic():
             diagnostic_log.append(f"🟢 Pivot Low(5,3): {pl.notna().sum()} عدد")
             diagnostic_log.append("🟢 تشخیص روند: فعال")
     except Exception as e:
-        diagnostic_log.append(f"🔴 خطا در محاسبات: {str(e)[:50]}")
-    
+        diagnostic_log.append(f"🔴 خطا: {str(e)[:50]}")
     diagnostic_log.append("🟢 موتور امتیازدهی: آماده")
     diagnostic_log.append("🟢 اتصال به تلگرام")
-    
     diagnostic_log.append("\n━━━━━━━━━━━━━━━━━━━━━━")
     diagnostic_log.append("✅ تمام بخش‌ها فعال هستند")
     diagnostic_log.append(f"🕒 {format_iran_time()}")
-    
     send_telegram_message("\n".join(diagnostic_log))
     logger.info("Startup Diagnostic Complete")
 
@@ -543,7 +617,7 @@ def detect_signal(df, state, symbol, debug=False):
     n = len(closed_df)
     if n < 33:
         log(f"❌ داده ناکافی: {n}")
-        return None, None, None, None, False, None, None, None, [], ""
+        return None, None, None, None, False, None, None, None, []
 
     close = closed_df["close"]
     high = closed_df["high"]
@@ -579,7 +653,6 @@ def detect_signal(df, state, symbol, debug=False):
 
     for i in range(start_bar, last_valid_pivot_index + 1):
         ts = closed_df_indexed.index[i]
-
         if not pd.isna(pivot_high.iloc[i]) and ts not in existing_high_ts:
             new_pivots_high.append({
                 'ts': ts, 'price': pivot_high.iloc[i],
@@ -606,7 +679,6 @@ def detect_signal(df, state, symbol, debug=False):
 
     early_signal = len(new_pivots_high) > 0 or len(new_pivots_low) > 0
     entry_price = close.iloc[-1]
-    current_price = df['close'].iloc[-1]
 
     buy_signal = sell_signal = None
     buy_emoji = sell_emoji = None
@@ -614,88 +686,75 @@ def detect_signal(df, state, symbol, debug=False):
     buy_score = sell_score = 0
     buy_stop = buy_target = sell_stop = sell_target = None
     buy_details = sell_details = []
-    buy_signal_type = sell_signal_type = ""
 
     # BUY
-    if len(state.pivot_lows) >= 2:
+    if len(new_pivots_low) > 0 and len(state.pivot_lows) >= 2:
         pl_1, pl_2 = state.pivot_lows[-2], state.pivot_lows[-1]
         bar1 = resolve_bar_from_ts(closed_df_indexed, pl_1['ts'])
+        bar2 = resolve_bar_from_ts(closed_df_indexed, pl_2['ts'])
 
-        if bar1 is not None:
-            is_classic_buy = pl_2['price'] < pl_1['price']
-            is_hidden_buy = pl_2['price'] > pl_1['price']
+        if bar1 is not None and bar2 is not None:
+            trend_ok = is_trending_down(close, bar1, TREND_LOOKBACK, TREND_SLOPE_MIN_PCT)
+            log(f"   🔵 BUY check: bar1={bar1}, bar2={bar2}, trend={'✅' if trend_ok else '❌'}")
 
-            if is_classic_buy or is_hidden_buy:
-                if is_classic_buy:
-                    trend_ok = is_trending_down(close, bar1, 20, 0.05)
-                    log(f"   🔵 Classic BUY check: bar1={bar1}, trend={'✅' if trend_ok else '❌'}")
-                else:
-                    trend_ok = True
-                    log(f"   🔵 Hidden BUY check: bar1={bar1}, trend=⏭️ (skipped)")
+            if trend_ok:
+                score, details = calculate_divergence_score(
+                    pl_1, pl_2, "BUY", bar1, bar2, hist_line, high, low, closed_df_indexed, atr14.iloc[-1]
+                )
+                buy_emoji, buy_label = classify_signal(score)
+                buy_score = score
+                buy_details = details
+                log(f"   🔵 BUY score={score}/5 {'✅' if buy_emoji else '❌'}")
+                for d in details:
+                    log(f"      {d}")
 
-                if trend_ok:
-                    score, details = calculate_divergence_score(pl_1, pl_2, "BUY", df, current_price)
-                    buy_emoji, buy_label, buy_score, _ = classify_signal(score, details, "BUY")
-                    buy_details = details
-                    buy_signal_type = "Classic" if is_classic_buy else "Hidden"
-                    log(f"   🔵 {buy_signal_type} BUY score={score}/5 {'✅' if buy_emoji else '❌'}")
-                    if score >= 2:
-                        for d in details:
-                            log(f"      {d}")
-
-                    if buy_emoji and score >= 3:
-                        stop, tp_raw, _ = compute_stop_and_targets(
-                            state.pivot_highs, state.pivot_lows, "long", closed_df_indexed, atr14.iloc[-1]
-                        )
-                        if stop and tp_raw:
-                            buy_stop, buy_target = stop, resolve_final_target(entry_price, stop, tp_raw, "long")
-                            buy_signal = "BUY"
-                            log(f"   Entry={entry_price:.4f}, SL={stop:.4f}, TP={buy_target:.4f}")
+                if buy_emoji and score >= 3:
+                    stop, tp_raw, _ = compute_stop_and_targets(
+                        state.pivot_highs, state.pivot_lows, "long", closed_df_indexed, atr14.iloc[-1]
+                    )
+                    if stop and tp_raw:
+                        buy_stop, buy_target = stop, resolve_final_target(entry_price, stop, tp_raw, "long")
+                        buy_signal = "BUY"
+                        log(f"   Entry={entry_price:.4f}, SL={stop:.4f}, TP={buy_target:.4f}")
         else:
-            log(f"   🔵 BUY: pl_1 ts not in current window")
+            log(f"   🔵 BUY: bar1/bar2 قابل resolve نبود")
 
     # SELL
-    if len(state.pivot_highs) >= 2:
+    if len(new_pivots_high) > 0 and len(state.pivot_highs) >= 2:
         ph_1, ph_2 = state.pivot_highs[-2], state.pivot_highs[-1]
         bar1 = resolve_bar_from_ts(closed_df_indexed, ph_1['ts'])
+        bar2 = resolve_bar_from_ts(closed_df_indexed, ph_2['ts'])
 
-        if bar1 is not None:
-            is_classic_sell = ph_2['price'] > ph_1['price']
-            is_hidden_sell = ph_2['price'] < ph_1['price']
+        if bar1 is not None and bar2 is not None:
+            trend_ok = is_trending_up(close, bar1, TREND_LOOKBACK, TREND_SLOPE_MIN_PCT)
+            log(f"   🔴 SELL check: bar1={bar1}, bar2={bar2}, trend={'✅' if trend_ok else '❌'}")
 
-            if is_classic_sell or is_hidden_sell:
-                if is_classic_sell:
-                    trend_ok = is_trending_up(close, bar1, 20, 0.05)
-                    log(f"   🔴 Classic SELL check: bar1={bar1}, trend={'✅' if trend_ok else '❌'}")
-                else:
-                    trend_ok = True
-                    log(f"   🔴 Hidden SELL check: bar1={bar1}, trend=⏭️ (skipped)")
+            if trend_ok:
+                score, details = calculate_divergence_score(
+                    ph_1, ph_2, "SELL", bar1, bar2, hist_line, high, low, closed_df_indexed, atr14.iloc[-1]
+                )
+                sell_emoji, sell_label = classify_signal(score)
+                sell_score = score
+                sell_details = details
+                log(f"   🔴 SELL score={score}/5 {'✅' if sell_emoji else '❌'}")
+                for d in details:
+                    log(f"      {d}")
 
-                if trend_ok:
-                    score, details = calculate_divergence_score(ph_1, ph_2, "SELL", df, current_price)
-                    sell_emoji, sell_label, sell_score, _ = classify_signal(score, details, "SELL")
-                    sell_details = details
-                    sell_signal_type = "Classic" if is_classic_sell else "Hidden"
-                    log(f"   🔴 {sell_signal_type} SELL score={score}/5 {'✅' if sell_emoji else '❌'}")
-                    if score >= 2:
-                        for d in details:
-                            log(f"      {d}")
-
-                    if sell_emoji and score >= 3:
-                        stop, tp_raw, _ = compute_stop_and_targets(
-                            state.pivot_highs, state.pivot_lows, "short", closed_df_indexed, atr14.iloc[-1]
-                        )
-                        if stop and tp_raw:
-                            sell_stop, sell_target = stop, resolve_final_target(entry_price, stop, tp_raw, "short")
-                            sell_signal = "SELL"
-                            log(f"   Entry={entry_price:.4f}, SL={stop:.4f}, TP={sell_target:.4f}")
+                if sell_emoji and score >= 3:
+                    stop, tp_raw, _ = compute_stop_and_targets(
+                        state.pivot_highs, state.pivot_lows, "short", closed_df_indexed, atr14.iloc[-1]
+                    )
+                    if stop and tp_raw:
+                        sell_stop, sell_target = stop, resolve_final_target(entry_price, stop, tp_raw, "short")
+                        sell_signal = "SELL"
+                        log(f"   Entry={entry_price:.4f}, SL={stop:.4f}, TP={sell_target:.4f}")
         else:
-            log(f"   🔴 SELL: ph_1 ts not in current window")
+            log(f"   🔴 SELL: bar1/bar2 قابل resolve نبود")
 
     if not buy_signal and not sell_signal:
         log(f"   ⚪ No signal")
 
-    # ⚡ ارسال لاگ به تلگرام
+    # لاگ تلگرام
     current_time = time.time()
     should_send = False
     if state.telegram_log_count < 10:
@@ -722,54 +781,62 @@ def detect_signal(df, state, symbol, debug=False):
             logger.error(f"[TELEGRAM] {e}")
 
     if buy_signal:
-        return "BUY", entry_price, buy_stop, buy_target, early_signal, buy_emoji, buy_label, buy_score, buy_details, buy_signal_type
+        return "BUY", entry_price, buy_stop, buy_target, early_signal, buy_emoji, buy_label, buy_score, buy_details
     elif sell_signal:
-        return "SELL", entry_price, sell_stop, sell_target, early_signal, sell_emoji, sell_label, sell_score, sell_details, sell_signal_type
-    return None, None, None, None, early_signal, None, None, None, [], ""
+        return "SELL", entry_price, sell_stop, sell_target, early_signal, sell_emoji, sell_label, sell_score, sell_details
+    return None, None, None, None, early_signal, None, None, None, []
 
 # =====================================================================================
-# پیگیری سیگنال‌های باز
+# پیگیری سیگنال‌های باز — هشدار فقط در R:R=1.5 و 75% استاپ
 # =====================================================================================
-def check_proximity(symbol, current_price, entry, stop, target, state):
+_proximity_states = {}
+
+def check_proximity(symbol, current_price, entry, stop, target, direction, state):
+    """
+    هشدار نزدیکی:
+    - تارگت: فقط وقتی R:R به 1.5 برسه (60% راه)
+    - استاپ: فقط وقتی 75% راه رفته (25% مونده)
+    هر کدام فقط یک بار هشدار داده می‌شود.
+    """
     if entry is None or stop is None or target is None:
         return
-    
-    stop_distance = abs(current_price - stop) / entry * 100
-    target_distance = abs(current_price - target) / entry * 100
-    
-    thresholds = [5.0, 3.0, 1.0, 0.5]
-    
-    if target_distance > 0:
-        for t in thresholds:
-            if target_distance <= t:
-                if not hasattr(state, '_last_target_alert') or state._last_target_alert is None or target_distance < t:
-                    send_telegram_message(
-                        f"🎯 نزدیک شدن به حد سود\n\n"
-                        f"🔹 نماد: {symbol}\n"
-                        f"💰 قیمت فعلی: {current_price:.4f}\n"
-                        f"🎯 حد سود: {target:.4f}\n"
-                        f"📊 فاصله: {target_distance:.2f}%\n\n"
-                        f"⏳ در آستانه بسته شدن\n"
-                        f"🕒 {format_iran_time()}"
-                    )
-                    state._last_target_alert = t
-                break
-    
-    if stop_distance > 0:
-        for t in thresholds:
-            if stop_distance <= t:
-                if not hasattr(state, '_last_stop_alert') or state._last_stop_alert is None or stop_distance < t:
-                    send_telegram_message(
-                        f"⚠️ نزدیک شدن به حد ضرر\n\n"
-                        f"🔹 نماد: {symbol}\n"
-                        f"💰 قیمت فعلی: {current_price:.4f}\n"
-                        f"🛑 حد ضرر: {stop:.4f}\n"
-                        f"📊 فاصله: {stop_distance:.2f}%\n\n"
-                        f"⚠️ نیاز به پایش دقیق\n"
-                        f"🕒 {format_iran_time()}"
-                    )
-                    state._last_stop_alert = t
-                break
+
+    risk_dist = abs(entry - stop)
+    reward_dist = abs(target - entry)
+
+    if direction == 'BUY':
+        stop_progress = (entry - current_price) / risk_dist if risk_dist > 0 else 0  # 0=entry, 1=stop
+        target_progress = (current_price - entry) / reward_dist if reward_dist > 0 else 0  # 0=entry, 1=target
+    else:
+        stop_progress = (current_price - entry) / risk_dist if risk_dist > 0 else 0
+        target_progress = (entry - current_price) / reward_dist if reward_dist > 0 else 0
+
+    # هشدار استاپ: 75% راه رفته (stop_progress >= 0.75)
+    if stop_progress >= 0.75 and not state.get('_stop_alert_sent', False):
+        state['_stop_alert_sent'] = True
+        send_telegram_message(
+            f"⚠️ هشدار نزدیکی به حد ضرر (75%)\n\n"
+            f"🔹 نماد: {symbol}\n"
+            f"💰 قیمت فعلی: {current_price:.4f}\n"
+            f"🛑 حد ضرر: {stop:.4f}\n"
+            f"📊 مسافت طی شده: {stop_progress*100:.1f}% به سمت استاپ\n\n"
+            f"⚠️ فقط ۲۵٪ تا فعال شدن حد ضرر باقی مانده\n"
+            f"🕒 {format_iran_time()}"
+        )
+
+    # هشدار تارگت: R:R >= 1.5 (یعنی target_progress >= 0.60)
+    if target_progress >= 0.60 and not state.get('_target_alert_sent', False):
+        state['_target_alert_sent'] = True
+        unrealized_r = target_progress / (1 - target_progress) if target_progress < 1 else 999
+        send_telegram_message(
+            f"🎯 هشدار نزدیکی به حد سود (R:R = 1.5)\n\n"
+            f"🔹 نماد: {symbol}\n"
+            f"💰 قیمت فعلی: {current_price:.4f}\n"
+            f"🎯 حد سود: {target:.4f}\n"
+            f"📊 پیشرفت: {target_progress*100:.1f}% به سمت تارگت\n"
+            f"⚖️ R:R فعلی: {unrealized_r:.1f}\n\n"
+            f"🕒 {format_iran_time()}"
+        )
 
 def track_open_signals():
     history = load_history()
@@ -783,18 +850,19 @@ def track_open_signals():
             entry = trade['entry_price']
             stop = trade['stop_loss']
             target = trade['take_profit']
-            
+            direction = trade['direction']
+
             key = f"{trade['symbol']}_{trade['signal_time']}"
             if key not in _proximity_states:
-                _proximity_states[key] = ProximityState()
-            
-            check_proximity(trade['symbol'], cp, entry, stop, target, _proximity_states[key])
-            
-            if trade['direction'] == 'BUY':
-                if cp >= target and not _proximity_states[key]._target_hit_notified:
-                    update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
+                _proximity_states[key] = {}
+            state = _proximity_states[key]
+
+            check_proximity(trade['symbol'], cp, entry, stop, target, direction, state)
+
+            if direction == 'BUY':
+                if cp >= target:
                     profit_pct = (cp-entry)/entry*100
-                    _proximity_states[key]._target_hit_notified = True
+                    update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
                     send_telegram_message(
                         f"🎯 حد سود فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -804,10 +872,9 @@ def track_open_signals():
                         f"📈 میزان سود: +{profit_pct:.2f}%\n"
                         f"🕒 {format_iran_time()}"
                     )
-                elif cp <= stop and not _proximity_states[key]._stop_hit_notified:
-                    update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
+                elif cp <= stop:
                     loss_pct = (cp-entry)/entry*100
-                    _proximity_states[key]._stop_hit_notified = True
+                    update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
                     send_telegram_message(
                         f"💔 حد ضرر فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -818,10 +885,9 @@ def track_open_signals():
                         f"🕒 {format_iran_time()}"
                     )
             else:
-                if cp <= target and not _proximity_states[key]._target_hit_notified:
-                    update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
+                if cp <= target:
                     profit_pct = (entry-cp)/entry*100
-                    _proximity_states[key]._target_hit_notified = True
+                    update_trade_result(trade['symbol'], trade['signal_time'], 'TAKE_PROFIT', cp)
                     send_telegram_message(
                         f"🎯 حد سود فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -831,10 +897,9 @@ def track_open_signals():
                         f"📈 میزان سود: +{profit_pct:.2f}%\n"
                         f"🕒 {format_iran_time()}"
                     )
-                elif cp >= stop and not _proximity_states[key]._stop_hit_notified:
-                    update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
+                elif cp >= stop:
                     loss_pct = (entry-cp)/entry*100
-                    _proximity_states[key]._stop_hit_notified = True
+                    update_trade_result(trade['symbol'], trade['signal_time'], 'STOP_LOSS', cp)
                     send_telegram_message(
                         f"💔 حد ضرر فعال شد\n\n"
                         f"🔹 نماد: {trade['symbol']}\n"
@@ -864,7 +929,6 @@ def analyze_and_send():
             result = detect_signal(df, SYMBOL_STATES[symbol], symbol, debug=True)
             signal, entry, stop, target, early, emoji, label, score = result[:8]
             details = result[8] if len(result) > 8 else []
-            signal_type = result[9] if len(result) > 9 else ""
             cp = df['close'].iloc[-1]
 
             if early and not SYMBOL_STATES[symbol].alert_sent:
@@ -879,25 +943,22 @@ def analyze_and_send():
                 )
 
             if signal and stop and target:
-                # رند کردن قیمت‌ها
                 entry = round_price(entry, symbol)
                 stop = round_price(stop, symbol)
                 target = round_price(target, symbol)
-                
+
                 profit_pct = (target-entry)/entry*100 if signal=="BUY" else (entry-target)/entry*100
                 loss_pct = (entry-stop)/entry*100 if signal=="BUY" else (stop-entry)/entry*100
                 rr = abs(profit_pct/loss_pct) if loss_pct != 0 else 0
                 direction_text = "LONG (خرید)" if signal == "BUY" else "SHORT (فروش)"
                 direction_emoji = "🟢" if signal == "BUY" else "🔴"
-                
+
                 details_text = ""
                 if details:
                     details_text = "\n".join([f"{i+1}. {d}" for i, d in enumerate(details)])
-                
-                signal_label = f"{label} ({signal_type})" if signal_type else label
-                
+
                 send_telegram_message(
-                    f"{emoji} سیگنال {signal_label} — {symbol}\n"
+                    f"{emoji} سیگنال {label} — {symbol}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📊 امتیاز: {score}/5\n"
                     f"🔸 نوع: {direction_emoji} {direction_text}\n\n"
@@ -932,21 +993,21 @@ def analyze_and_send():
 def signal_loop():
     last_daily_report = None
     last_monthly_report = None
-    
+
     while True:
         try:
             logger.info(f"[LOOP] {format_iran_time()}")
             analyze_and_send()
-            
+
             today = format_iran_date()
             if last_daily_report != today:
                 send_daily_report()
                 last_daily_report = today
-            
+
             if last_monthly_report is None or (datetime.now(timezone(timedelta(hours=3, minutes=30))) - last_monthly_report).days >= 30:
                 send_monthly_report()
                 last_monthly_report = datetime.now(timezone(timedelta(hours=3, minutes=30)))
-            
+
             time.sleep(60)
         except Exception as e:
             logger.error(f"[LOOP] {e}")
@@ -960,26 +1021,24 @@ def health():
 
 if __name__ == "__main__":
     logger.info("Signal Bot Pro Starting...")
-    
+
     send_telegram_message(
         "🤖 SignalBot Pro — آنلاین\n\n"
-        "🧠 استراتژی: DTM Divergence\n"
+        "🧠 استراتژی: DTM Divergence (منطبق با Pine Script)\n"
         "📊 سیگنال‌دهی: خودکار (فقط سیگنال)\n"
         "❌ ترید خودکار: غیرفعال\n\n"
         "⚙️ تنظیمات:\n"
         "• Timeframe: 1m\n"
-        "• Pivot: Left=5, Right=3\n"
+        "• Pivot: حالت سریع Left=5, Right=3\n"
         "• Memory: 100 Pivot\n"
-        "• Scoring: 3-Level (🟢🟡⚪)\n"
-        "• Trend Filter: Classic only\n"
-        "• Symbols: LTC, DOGE, ETH, BNB, SOL, PAXG\n"
-        "• Price Precision: 2-10 decimals\n\n"
+        "• Scoring: 5-Level (RSI+MACD Line+MACD Hist + Fib + PA)\n"
+        "• Symbols: LTC, DOGE, ETH, BNB, SOL, PAXG\n\n"
         f"🕒 {format_iran_time()}"
     )
-    
+
     run_startup_diagnostic()
-    
+
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
     logger.info("[STARTUP] Flask روی پورت 10000")
-    
+
     signal_loop()
