@@ -7,6 +7,8 @@ Signal Bot Pro - TheTrueTrade (نسخه Multi-Timeframe)
 + منطق دقیقاً مطابق Pine Script
 + رفع مشکل تایم‌فریم‌های بالاتر با countback مناسب
 + حذف هشدار نزدیکی به تارگت و استاپ
++ رفع باگ RSI/MACD در Pivot (همان کندل Pivot)
++ رفع باگ فرمول روند (تفاضل مقدار برازش دو رگرسیون مثل ta.linreg)
 """
 
 import os
@@ -62,29 +64,19 @@ BIG_CANDLE_MULTIPLIER = 1.5
 # =====================================================================================
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "2h", "4h"]
 
-# طبق کتابچه API: resolution باید "1", "5", "15", "30", "60", "120", "240" باشد
 RESOLUTION_MAP = {
     "1m": "1", "5m": "5", "15m": "15", "30m": "30",
     "1h": "60", "2h": "120", "4h": "240",
 }
 
-# مدت زمان هر کندل به دقیقه
 TF_MINUTES = {
     "1m": 1, "5m": 5, "15m": 15, "30m": 30,
     "1h": 60, "2h": 120, "4h": 240,
 }
 
-# countback مناسب برای هر تایم‌فریم
-# طبق کتابچه API: محدودیتی برای countback ذکر نشده، اما برای تایم‌فریم‌های بالاتر
-# باید limit رو کمتر کنیم تا from_timestamp از محدوده داده‌های موجود خارج نشه
 TF_LIMITS = {
-    "1m": 500,
-    "5m": 500,
-    "15m": 500,
-    "30m": 500,
-    "1h": 300,
-    "2h": 200,
-    "4h": 100,
+    "1m": 500, "5m": 500, "15m": 500, "30m": 500,
+    "1h": 300, "2h": 200, "4h": 100,
 }
 
 # =====================================================================================
@@ -120,24 +112,12 @@ class TrueTradeData:
         self.base_url = BASE_URL
 
     def fetch_ohlcv(self, symbol, timeframe='1m', limit=500):
-        """
-        دریافت داده‌های OHLCV از API صرافی.
-        طبق کتابچه API:
-        - resolution: عددی مانند "1", "60", "240"
-        - from, to: Unix timestamp به ثانیه
-        - countback: تعداد کندل‌های درخواستی
-        """
         symbol_clean = symbol.upper()
-
-        # طبق کتابچه API: resolution باید عددی باشد
         resolution = RESOLUTION_MAP.get(timeframe, "1")
-
-        # طبق کتابچه API: from و to باید Unix timestamp به ثانیه باشند
         minutes = TF_MINUTES.get(timeframe, 1)
         to_timestamp = int(time.time())
         from_timestamp = to_timestamp - (limit * minutes * 60)
 
-        # طبق کتابچه API: پارامترها → symbol, resolution, from, to, countback
         uri = (
             f"/futures/udf/history"
             f"?symbol={symbol_clean}"
@@ -165,9 +145,7 @@ class TrueTradeData:
                 'volume': pd.to_numeric(data['v'])
             })
             df.set_index('timestamp', inplace=True)
-
             logger.info(f"[DATA] {symbol} {timeframe}: {len(df)} candles (limit={limit})")
-
             return df
 
         except Exception as e:
@@ -237,30 +215,55 @@ def find_pivot_low(low, left=5, right=3):
             result.iloc[i] = low.iloc[i]
     return result
 
+# =====================================================================================
+# روند — دقیقاً مثل Pine Script: تفاضل مقدار برازش دو ta.linreg
+# =====================================================================================
+def _linreg_end(y):
+    """مقدار برازش شده رگرسیون خطی در آخرین نقطه (مثل ta.linreg با offset=0)"""
+    x = np.arange(len(y))
+    slope, intercept = np.polyfit(x, y, 1)
+    return intercept + slope * (len(y) - 1)
+
 def is_trending_up(close, ref_bar, lookback=TREND_LOOKBACK, slope_min_pct=TREND_SLOPE_MIN_PCT):
-    if ref_bar is None or ref_bar - lookback < 0:
+    if ref_bar is None or ref_bar - 2 * lookback + 1 < 0:
         return False
-    y = close.iloc[ref_bar - lookback:ref_bar + 1].values
-    if len(y) < 2:
+    
+    y_current = close.iloc[ref_bar - lookback + 1:ref_bar + 1].values
+    y_past = close.iloc[ref_bar - 2 * lookback + 1:ref_bar - lookback + 1].values
+    
+    if len(y_current) < 2 or len(y_past) < 2:
         return False
-    slope_per_bar = np.polyfit(np.arange(len(y)), y, 1)[0]
-    total_slope = slope_per_bar * lookback
-    avg = y.mean()
+    
+    fitted_end_current = _linreg_end(y_current)
+    fitted_end_past = _linreg_end(y_past)
+    
+    total_slope = fitted_end_current - fitted_end_past
+    
+    avg = y_current.mean()
     if avg == 0:
         return False
+    
     return (total_slope / avg) * 100 > slope_min_pct
 
 def is_trending_down(close, ref_bar, lookback=TREND_LOOKBACK, slope_min_pct=TREND_SLOPE_MIN_PCT):
-    if ref_bar is None or ref_bar - lookback < 0:
+    if ref_bar is None or ref_bar - 2 * lookback + 1 < 0:
         return False
-    y = close.iloc[ref_bar - lookback:ref_bar + 1].values
-    if len(y) < 2:
+    
+    y_current = close.iloc[ref_bar - lookback + 1:ref_bar + 1].values
+    y_past = close.iloc[ref_bar - 2 * lookback + 1:ref_bar - lookback + 1].values
+    
+    if len(y_current) < 2 or len(y_past) < 2:
         return False
-    slope_per_bar = np.polyfit(np.arange(len(y)), y, 1)[0]
-    total_slope = slope_per_bar * lookback
-    avg = y.mean()
+    
+    fitted_end_current = _linreg_end(y_current)
+    fitted_end_past = _linreg_end(y_past)
+    
+    total_slope = fitted_end_current - fitted_end_past
+    
+    avg = y_current.mean()
     if avg == 0:
         return False
+    
     return (total_slope / avg) * 100 < -slope_min_pct
 
 def resolve_bar_from_ts(df_indexed, ts):
@@ -537,7 +540,6 @@ class SymbolState:
         self.telegram_log_count = 0
         self.last_telegram_log_time = 0
 
-# ساخت State برای همه ترکیب‌ها
 SYMBOL_STATES = {}
 for sym in SYMBOLS:
     for tf in TIMEFRAMES:
@@ -586,7 +588,6 @@ def send_daily_report():
     closed = wins + losses
     win_rate = (wins / closed * 100) if closed > 0 else 0
 
-    # گزارش کلی
     message = f"""📊 گزارش روزانه — {today_str}
 ━━━━━━━━━━━━━━━━━━━━━━
 
@@ -600,7 +601,6 @@ def send_daily_report():
 
 📈 به تفکیک تایم‌فریم:"""
 
-    # گزارش به تفکیک تایم‌فریم
     for tf in TIMEFRAMES:
         tf_trades = [t for t in today_trades if t.get('timeframe') == tf]
         if tf_trades:
@@ -880,7 +880,7 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
     if not buy_signal and not sell_signal:
         log(f"   ⚪ No signal")
 
-    # لاگ تلگرام - مثل پروژه ۱: ۵ بار اول هر ۵ دقیقه
+    # لاگ تلگرام
     current_time = time.time()
     should_send = False
     if state.telegram_log_count < 5:
@@ -989,7 +989,6 @@ def analyze_and_send():
     for symbol in SYMBOLS:
         for timeframe in TIMEFRAMES:
             try:
-                # استفاده از limit مناسب برای هر تایم‌فریم
                 limit = TF_LIMITS.get(timeframe, 500)
                 df = data.fetch_ohlcv(symbol, timeframe, limit)
                 if df is None or df.empty:
