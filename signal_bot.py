@@ -5,10 +5,10 @@ Signal Bot Pro - TheTrueTrade (نسخه Multi-Timeframe)
 ربات سیگنال‌دهی پیشرفته - فقط ارسال سیگنال (بدون ترید خودکار)
 نسخه نهایی کامل با ۷ تایم‌فریم و ۱۱ ارز
 + منطق دقیقاً مطابق Pine Script
-+ رفع مشکل تایم‌فریم‌های بالاتر با countback مناسب
++ RSI با Wilder Smoothing (calc_rma مثل ta.rma در Pine)
++ رفع درز State پیوت‌ها (start_bar=0 همیشه)
++ حذف لاگ‌های دیباگ و پیام تشکیل پیوت
 + حذف هشدار نزدیکی به تارگت و استاپ
-+ رفع باگ RSI/MACD در Pivot (همان کندل Pivot)
-+ رفع باگ فرمول روند (تفاضل مقدار برازش دو رگرسیون مثل ta.linreg)
 """
 
 import os
@@ -75,8 +75,8 @@ TF_MINUTES = {
 }
 
 TF_LIMITS = {
-    "1m": 500, "5m": 500, "15m": 500, "30m": 500,
-    "1h": 300, "2h": 200, "4h": 100,
+    "1m": 1500, "5m": 1500, "15m": 1500, "30m": 1500,
+    "1h": 500, "2h": 300, "4h": 200,
 }
 
 # =====================================================================================
@@ -133,7 +133,7 @@ class TrueTradeData:
             data = response.json()
 
             if not data or data.get('s') != 'ok':
-                logger.warning(f"[API] {symbol} {timeframe}: s != ok, response: {str(data)[:200]}")
+                logger.warning(f"[API] {symbol} {timeframe}: s != ok")
                 return None
 
             df = pd.DataFrame({
@@ -145,7 +145,6 @@ class TrueTradeData:
                 'volume': pd.to_numeric(data['v'])
             })
             df.set_index('timestamp', inplace=True)
-            logger.info(f"[DATA] {symbol} {timeframe}: {len(df)} candles (limit={limit})")
             return df
 
         except Exception as e:
@@ -175,12 +174,26 @@ def format_iran_date(dt=None):
 # =====================================================================================
 # توابع محاسباتی پایه
 # =====================================================================================
+def calc_rma(series, length):
+    """معادل دقیق ta.rma (Wilder Smoothing) در Pine Script"""
+    alpha = 1.0 / length
+    rma = pd.Series(np.nan, index=series.index)
+    if len(series) < length:
+        return rma
+    seed = series.iloc[:length].mean()
+    rma.iloc[length - 1] = seed
+    prev = seed
+    for i in range(length, len(series)):
+        prev = alpha * series.iloc[i] + (1 - alpha) * prev
+        rma.iloc[i] = prev
+    return rma
+
 def calc_rsi(close, length=14):
-    delta = close.diff()
+    delta = close.diff().fillna(0)
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1.0/length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0/length, min_periods=length, adjust=False).mean()
+    avg_gain = calc_rma(gain, length)
+    avg_loss = calc_rma(loss, length)
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - (100 / (1 + rs))).fillna(50)
 
@@ -215,11 +228,7 @@ def find_pivot_low(low, left=5, right=3):
             result.iloc[i] = low.iloc[i]
     return result
 
-# =====================================================================================
-# روند — دقیقاً مثل Pine Script: تفاضل مقدار برازش دو ta.linreg
-# =====================================================================================
 def _linreg_end(y):
-    """مقدار برازش شده رگرسیون خطی در آخرین نقطه (مثل ta.linreg با offset=0)"""
     x = np.arange(len(y))
     slope, intercept = np.polyfit(x, y, 1)
     return intercept + slope * (len(y) - 1)
@@ -236,7 +245,6 @@ def is_trending_up(close, ref_bar, lookback=TREND_LOOKBACK, slope_min_pct=TREND_
     
     fitted_end_current = _linreg_end(y_current)
     fitted_end_past = _linreg_end(y_past)
-    
     total_slope = fitted_end_current - fitted_end_past
     
     avg = y_current.mean()
@@ -257,7 +265,6 @@ def is_trending_down(close, ref_bar, lookback=TREND_LOOKBACK, slope_min_pct=TREN
     
     fitted_end_current = _linreg_end(y_current)
     fitted_end_past = _linreg_end(y_past)
-    
     total_slope = fitted_end_current - fitted_end_past
     
     avg = y_current.mean()
@@ -432,50 +439,25 @@ def round_price(price, symbol):
 def calculate_divergence_score(p1, p2, direction, bar1, bar2, hist_series, high_series, low_series, df_indexed, atr_series):
     details = []
 
-    # RSI
     if direction == "BUY":
-        if p2['price'] < p1['price'] and p2['rsi'] > p1['rsi']:
-            rsi_ok = True
-        elif p2['price'] > p1['price'] and p2['rsi'] < p1['rsi']:
-            rsi_ok = True
-        else:
-            rsi_ok = False
+        rsi_ok = (p2['price'] < p1['price'] and p2['rsi'] > p1['rsi']) or (p2['price'] > p1['price'] and p2['rsi'] < p1['rsi'])
     else:
-        if p2['price'] > p1['price'] and p2['rsi'] < p1['rsi']:
-            rsi_ok = True
-        elif p2['price'] < p1['price'] and p2['rsi'] > p1['rsi']:
-            rsi_ok = True
-        else:
-            rsi_ok = False
+        rsi_ok = (p2['price'] > p1['price'] and p2['rsi'] < p1['rsi']) or (p2['price'] < p1['price'] and p2['rsi'] > p1['rsi'])
     details.append("✅ RSI Divergence" if rsi_ok else "❌ RSI")
 
-    # MACD Line
     if direction == "BUY":
-        if p2['price'] < p1['price'] and p2['macdline'] > p1['macdline']:
-            macdline_ok = True
-        elif p2['price'] > p1['price'] and p2['macdline'] < p1['macdline']:
-            macdline_ok = True
-        else:
-            macdline_ok = False
+        macdline_ok = (p2['price'] < p1['price'] and p2['macdline'] > p1['macdline']) or (p2['price'] > p1['price'] and p2['macdline'] < p1['macdline'])
     else:
-        if p2['price'] > p1['price'] and p2['macdline'] < p1['macdline']:
-            macdline_ok = True
-        elif p2['price'] < p1['price'] and p2['macdline'] > p1['macdline']:
-            macdline_ok = True
-        else:
-            macdline_ok = False
+        macdline_ok = (p2['price'] > p1['price'] and p2['macdline'] < p1['macdline']) or (p2['price'] < p1['price'] and p2['macdline'] > p1['macdline'])
     details.append("✅ MACD Line Divergence" if macdline_ok else "❌ MACD Line")
 
-    # MACD Histogram
     if direction == "BUY":
-        hist_shape_ok = ((p2['price'] < p1['price'] and p2['hist'] > p1['hist']) or
-                         (p2['price'] > p1['price'] and p2['hist'] < p1['hist']))
+        hist_shape_ok = ((p2['price'] < p1['price'] and p2['hist'] > p1['hist']) or (p2['price'] > p1['price'] and p2['hist'] < p1['hist']))
         both_same_sign = p1['hist'] < 0 and p2['hist'] < 0
         color_changed = check_macd_color_change(hist_series, bar1, bar2, need_negative_phase=False)
         macdhist_ok = hist_shape_ok and both_same_sign and color_changed
     else:
-        hist_shape_ok = ((p2['price'] > p1['price'] and p2['hist'] < p1['hist']) or
-                         (p2['price'] < p1['price'] and p2['hist'] > p1['hist']))
+        hist_shape_ok = ((p2['price'] > p1['price'] and p2['hist'] < p1['hist']) or (p2['price'] < p1['price'] and p2['hist'] > p1['hist']))
         both_same_sign = p1['hist'] > 0 and p2['hist'] > 0
         color_changed = check_macd_color_change(hist_series, bar1, bar2, need_negative_phase=True)
         macdhist_ok = hist_shape_ok and both_same_sign and color_changed
@@ -488,7 +470,6 @@ def calculate_divergence_score(p1, p2, direction, bar1, bar2, hist_series, high_
 
     score = 3
 
-    # Fibonacci
     if direction == "BUY":
         trend_start = find_trend_start_high(high_series, bar1)
         fib_ok = check_fib_level(trend_start, p1['price'], p2['price'], is_retrace_down=False)
@@ -501,15 +482,11 @@ def calculate_divergence_score(p1, p2, direction, bar1, bar2, hist_series, high_
     else:
         details.append("❌ Fibonacci")
 
-    # Price Action
     confirm_bar2 = bar2 + RIGHT_BARS
     if confirm_bar2 < len(df_indexed):
-        pa_ok, pa_reasons = check_price_action(
-            df_indexed, confirm_bar2, direction, atr_series.iloc[confirm_bar2]
-        )
+        pa_ok, pa_reasons = check_price_action(df_indexed, confirm_bar2, direction, atr_series.iloc[confirm_bar2])
     else:
         pa_ok, pa_reasons = False, []
-
     if pa_ok:
         score += 1
         details.append(f"✅ Price Action ({', '.join(pa_reasons)})")
@@ -519,26 +496,19 @@ def calculate_divergence_score(p1, p2, direction, bar1, bar2, hist_series, high_
     return score, details
 
 def classify_signal(score):
-    if score >= 5:
-        return "🟢", "Ideal"
-    elif score >= 4:
-        return "🟡", "Custom"
-    elif score >= 3:
-        return "⚪", "Minimal"
-    else:
-        return None, None
+    if score >= 5: return "🟢", "Ideal"
+    elif score >= 4: return "🟡", "Custom"
+    elif score >= 3: return "⚪", "Minimal"
+    else: return None, None
 
 # =====================================================================================
-# کلاس وضعیت (برای هر ترکیب symbol+timeframe)
+# کلاس وضعیت
 # =====================================================================================
 class SymbolState:
     def __init__(self):
         self.pivot_highs = []
         self.pivot_lows = []
-        self.last_processed_ts = None
         self.alert_sent = False
-        self.telegram_log_count = 0
-        self.last_telegram_log_time = 0
 
 SYMBOL_STATES = {}
 for sym in SYMBOLS:
@@ -577,9 +547,7 @@ def send_daily_report():
     history = load_history()
     today_str = format_iran_date()
     today_trades = [t for t in history if t.get('signal_time', '').startswith(today_str)]
-
-    if not today_trades:
-        return
+    if not today_trades: return
 
     total = len(today_trades)
     wins = len([t for t in today_trades if t.get('result') == 'TAKE_PROFIT'])
@@ -600,14 +568,12 @@ def send_daily_report():
 💪 وضعیت: {'عالی! 🚀' if wins > losses else 'نیاز به بررسی 📊'}
 
 📈 به تفکیک تایم‌فریم:"""
-
     for tf in TIMEFRAMES:
         tf_trades = [t for t in today_trades if t.get('timeframe') == tf]
         if tf_trades:
             tf_wins = len([t for t in tf_trades if t.get('result') == 'TAKE_PROFIT'])
             tf_total = len(tf_trades)
             message += f"\n• {tf}: {tf_wins}/{tf_total} موفق"
-
     message += f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
     send_telegram_message(message)
 
@@ -615,9 +581,7 @@ def send_monthly_report():
     history = load_history()
     month_ago = (datetime.now(timezone(timedelta(hours=3, minutes=30))) - timedelta(days=30)).strftime('%Y-%m-%d')
     month_trades = [t for t in history if t.get('signal_time', '') >= month_ago]
-
-    if not month_trades:
-        return
+    if not month_trades: return
 
     total = len(month_trades)
     wins = len([t for t in month_trades if t.get('result') == 'TAKE_PROFIT'])
@@ -635,7 +599,6 @@ def send_monthly_report():
 📊 میانگین روزانه: {(wins-losses)/30:.1f} سیگنال
 
 📈 به تفکیک تایم‌فریم:"""
-
     for tf in TIMEFRAMES:
         tf_trades = [t for t in month_trades if t.get('timeframe') == tf]
         if tf_trades:
@@ -643,9 +606,7 @@ def send_monthly_report():
             tf_total = len(tf_trades)
             tf_win_rate = (tf_wins / tf_total * 100) if tf_total > 0 else 0
             message += f"\n• {tf}: {tf_wins}/{tf_total} ({tf_win_rate:.1f}%)"
-
-    message += f"\n\n💪 ارزیابی: {'پروژه موفق! 🎉' if wins > losses else 'نیاز به بهینه‌سازی ⚙️'}"
-    message += f"\n━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
+    message += f"\n\n💪 ارزیابی: {'پروژه موفق! 🎉' if wins > losses else 'نیاز به بهینه‌سازی ⚙️'}\n━━━━━━━━━━━━━━━━━━━━━━\n🕒 {format_iran_time()}"
     send_telegram_message(message)
 
 # =====================================================================================
@@ -653,17 +614,14 @@ def send_monthly_report():
 # =====================================================================================
 def run_startup_diagnostic():
     logger.info("Running Startup Diagnostic...")
-
     diagnostic_log = []
     diagnostic_log.append("🔍 بررسی سلامت سیستم")
     diagnostic_log.append("━━━━━━━━━━━━━━━━━━━━━━")
-
     try:
         requests.get("https://www.google.com", timeout=5)
         diagnostic_log.append("🟢 اتصال اینترنت")
     except:
         diagnostic_log.append("🔴 اتصال اینترنت")
-
     data = TrueTradeData()
     df = None
     try:
@@ -674,7 +632,6 @@ def run_startup_diagnostic():
             diagnostic_log.append("🔴 دریافت داده")
     except Exception as e:
         diagnostic_log.append(f"🔴 دریافت داده: {str(e)[:50]}")
-
     try:
         if df is not None and not df.empty:
             rsi = calc_rsi(df['close'], 14)
@@ -689,39 +646,26 @@ def run_startup_diagnostic():
             diagnostic_log.append("🟢 تشخیص روند: فعال")
     except Exception as e:
         diagnostic_log.append(f"🔴 خطا: {str(e)[:50]}")
-
     diagnostic_log.append("🟢 موتور امتیازدهی: آماده")
     diagnostic_log.append("🟢 اتصال به تلگرام")
-
     diagnostic_log.append(f"\n📊 تایم‌فریم‌ها: {', '.join(TIMEFRAMES)}")
     diagnostic_log.append(f"📊 ارزها: {len(SYMBOLS)} عدد")
     diagnostic_log.append(f"📊 ترکیب‌های فعال: {len(SYMBOLS) * len(TIMEFRAMES)}")
-
     diagnostic_log.append("\n━━━━━━━━━━━━━━━━━━━━━━")
     diagnostic_log.append("✅ تمام بخش‌ها فعال هستند")
     diagnostic_log.append(f"🕒 {format_iran_time()}")
-
     send_telegram_message("\n".join(diagnostic_log))
     logger.info("Startup Diagnostic Complete")
 
 # =====================================================================================
 # تابع تشخیص سیگنال
 # =====================================================================================
-def detect_signal(df, state, symbol, timeframe, debug=False):
-    debug_log = []
-    def log(msg):
-        debug_log.append(msg)
-        if debug:
-            logger.info(msg)
-
-    log(f"🔍 DTM — {symbol} {timeframe} | {format_iran_time()}")
-
+def detect_signal(df, state, symbol, timeframe):
     closed_df_indexed = df.iloc[:-1].copy()
     closed_df = closed_df_indexed.reset_index(drop=True)
 
     n = len(closed_df)
     if n < 33:
-        log(f"❌ داده ناکافی: {n}")
         return None, None, None, None, False, None, None, None, []
 
     close = closed_df["close"]
@@ -742,18 +686,8 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
     existing_high_ts = {p['ts'] for p in state.pivot_highs}
     existing_low_ts = {p['ts'] for p in state.pivot_lows}
 
-    if state.last_processed_ts is None:
-        start_bar = 0
-    else:
-        if state.last_processed_ts in closed_df_indexed.index:
-            last_pos = closed_df_indexed.index.get_loc(state.last_processed_ts)
-            start_bar = max(0, last_pos - 5)
-        else:
-            start_bar = max(0, n - 10)
-
+    start_bar = 0
     start_bar = min(start_bar, last_valid_pivot_index)
-
-    log(f"   n={n}, last_valid={last_valid_pivot_index}, start={start_bar}")
 
     for i in range(start_bar, last_valid_pivot_index + 1):
         ts = closed_df_indexed.index[i]
@@ -768,9 +702,6 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
                 'rsi': rsi_val.iloc[i], 'macdline': macd_line.iloc[i], 'hist': hist_line.iloc[i]
             })
 
-    if n > 0:
-        state.last_processed_ts = closed_df_indexed.index[min(last_valid_pivot_index, n-1)]
-
     state.pivot_highs.extend(new_pivots_high)
     state.pivot_lows.extend(new_pivots_low)
 
@@ -778,8 +709,6 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
         state.pivot_highs = state.pivot_highs[-100:]
     if len(state.pivot_lows) > 100:
         state.pivot_lows = state.pivot_lows[-100:]
-
-    log(f"   new_high={len(new_pivots_high)}, new_low={len(new_pivots_low)} | mem: H={len(state.pivot_highs)} L={len(state.pivot_lows)}")
 
     early_signal = len(new_pivots_high) > 0 or len(new_pivots_low) > 0
     entry_price = close.iloc[-1]
@@ -805,10 +734,8 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
                 should_score = False
                 if is_classic_buy:
                     trend_ok = is_trending_down(close, bar1, TREND_LOOKBACK, TREND_SLOPE_MIN_PCT)
-                    log(f"   🔵 Classic BUY: bar1={bar1}, bar2={bar2}, trend={'✅' if trend_ok else '❌'}")
                     should_score = trend_ok
                 else:
-                    log(f"   🔵 Hidden BUY: bar1={bar1}, bar2={bar2}, trend=⏭️ (skipped)")
                     should_score = True
 
                 if should_score:
@@ -818,10 +745,6 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
                     buy_emoji, buy_label = classify_signal(score)
                     buy_score = score
                     buy_details = details
-                    div_type = "Classic" if is_classic_buy else "Hidden"
-                    log(f"   🔵 {div_type} BUY score={score}/5 {'✅' if buy_emoji else '❌'}")
-                    for d in details:
-                        log(f"      {d}")
 
                     if buy_emoji and score >= 3:
                         stop, tp_raw, _ = compute_stop_and_targets(
@@ -830,9 +753,6 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
                         if stop and tp_raw:
                             buy_stop, buy_target = stop, resolve_final_target(entry_price, stop, tp_raw, "long")
                             buy_signal = "BUY"
-                            log(f"   Entry={entry_price:.4f}, SL={stop:.4f}, TP={buy_target:.4f}")
-        else:
-            log(f"   🔵 BUY: bar1/bar2 قابل resolve نبود")
 
     # SELL
     if len(new_pivots_high) > 0 and len(state.pivot_highs) >= 2:
@@ -848,10 +768,8 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
                 should_score = False
                 if is_classic_sell:
                     trend_ok = is_trending_up(close, bar1, TREND_LOOKBACK, TREND_SLOPE_MIN_PCT)
-                    log(f"   🔴 Classic SELL: bar1={bar1}, bar2={bar2}, trend={'✅' if trend_ok else '❌'}")
                     should_score = trend_ok
                 else:
-                    log(f"   🔴 Hidden SELL: bar1={bar1}, bar2={bar2}, trend=⏭️ (skipped)")
                     should_score = True
 
                 if should_score:
@@ -861,10 +779,6 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
                     sell_emoji, sell_label = classify_signal(score)
                     sell_score = score
                     sell_details = details
-                    div_type = "Classic" if is_classic_sell else "Hidden"
-                    log(f"   🔴 {div_type} SELL score={score}/5 {'✅' if sell_emoji else '❌'}")
-                    for d in details:
-                        log(f"      {d}")
 
                     if sell_emoji and score >= 3:
                         stop, tp_raw, _ = compute_stop_and_targets(
@@ -873,38 +787,6 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
                         if stop and tp_raw:
                             sell_stop, sell_target = stop, resolve_final_target(entry_price, stop, tp_raw, "short")
                             sell_signal = "SELL"
-                            log(f"   Entry={entry_price:.4f}, SL={stop:.4f}, TP={sell_target:.4f}")
-        else:
-            log(f"   🔴 SELL: bar1/bar2 قابل resolve نبود")
-
-    if not buy_signal and not sell_signal:
-        log(f"   ⚪ No signal")
-
-    # لاگ تلگرام
-    current_time = time.time()
-    should_send = False
-    if state.telegram_log_count < 5:
-        if state.last_telegram_log_time == 0 or (current_time - state.last_telegram_log_time) >= 300:
-            should_send = True
-    else:
-        if current_time - state.last_telegram_log_time >= 21600:
-            should_send = True
-
-    if should_send:
-        state.last_telegram_log_time = current_time
-        state.telegram_log_count += 1
-        try:
-            telegram_debug = "\n".join(debug_log)
-            prefix = "🟢" if len(new_pivots_high)+len(new_pivots_low) > 0 else "ℹ️"
-            send_telegram_message(
-                f"{prefix} لاگ #{state.telegram_log_count} — {symbol} {timeframe}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"```\n{telegram_debug[:3000]}\n```\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🕒 {format_iran_time()}"
-            )
-        except Exception as e:
-            logger.error(f"[TELEGRAM] {e}")
 
     if buy_signal:
         return "BUY", entry_price, buy_stop, buy_target, early_signal, buy_emoji, buy_label, buy_score, buy_details
@@ -918,7 +800,7 @@ def detect_signal(df, state, symbol, timeframe, debug=False):
 def analyze_and_send():
     data = TrueTradeData()
     
-    # پیگیری سیگنال‌های باز (فقط تارگت و استاپ، بدون هشدار نزدیکی)
+    # پیگیری سیگنال‌های باز
     history = load_history()
     for trade in history:
         if trade.get('result') is None:
@@ -997,22 +879,9 @@ def analyze_and_send():
                 state_key = f"{symbol}_{timeframe}"
                 state = SYMBOL_STATES[state_key]
 
-                result = detect_signal(df, state, symbol, timeframe, debug=True)
+                result = detect_signal(df, state, symbol, timeframe)
                 signal, entry, stop, target, early, emoji, label, score = result[:8]
                 details = result[8] if len(result) > 8 else []
-                cp = df['close'].iloc[-1]
-
-                if early and not state.alert_sent:
-                    state.alert_sent = True
-                    send_telegram_message(
-                        f"⚡ در حال تشکیل Pivot جدید\n\n"
-                        f"🔹 نماد: {symbol}\n"
-                        f"⏱️ تایم‌فریم: {timeframe}\n"
-                        f"💰 قیمت: {cp:.4f}\n"
-                        f"📊 نوع: کف/قله جدید\n\n"
-                        f"⏳ تا تأیید نهایی در تایم‌فریم {timeframe}\n"
-                        f"🕒 {format_iran_time()}"
-                    )
 
                 if signal and stop and target:
                     entry = round_price(entry, symbol)
@@ -1054,8 +923,6 @@ def analyze_and_send():
                         'score': score, 'label': label, 'timeframe': timeframe
                     })
                     save_history(history)
-
-                    state.alert_sent = False
 
             except Exception as e:
                 logger.error(f"[ERROR] {symbol} {timeframe}: {e}")
@@ -1104,8 +971,7 @@ if __name__ == "__main__":
         f"• Timeframes: {', '.join(TIMEFRAMES)}\n"
         f"• Symbols: {len(SYMBOLS)} عدد\n"
         f"• Total Pairs: {len(SYMBOLS) * len(TIMEFRAMES)}\n"
-        f"• Pivot: 5/3 | Scoring: 5-Level\n"
-        f"• Countback: 1m/5m/15m/30m=500, 1h=300, 2h=200, 4h=100\n\n"
+        f"• Pivot: 5/3 | Scoring: 5-Level\n\n"
         f"🕒 {format_iran_time()}"
     )
 
